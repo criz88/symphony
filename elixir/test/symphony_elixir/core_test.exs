@@ -467,6 +467,125 @@ defmodule SymphonyElixir.CoreTest do
     assert updated_entry.issue.state == "In Progress"
   end
 
+  test "normal agent entering review monitor state starts grace window without release" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      review_monitor_enabled: true,
+      review_monitor_states: ["In Review"],
+      in_review_grace_shutdown_ms: 120_000
+    )
+
+    issue_id = "issue-review-grace-start"
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          worker_type: :agent,
+          identifier: "MT-558",
+          issue: %Issue{id: issue_id, state: "In Progress", identifier: "MT-558"},
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-558",
+      state: "In Review",
+      title: "Review handoff",
+      description: "Agent should get a grace window",
+      labels: []
+    }
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+    updated_entry = updated_state.running[issue_id]
+
+    assert Map.has_key?(updated_state.running, issue_id)
+    assert MapSet.member?(updated_state.claimed, issue_id)
+    assert Process.alive?(agent_pid)
+    assert updated_entry.issue.state == "In Review"
+    assert %DateTime{} = updated_entry.in_review_grace_started_at
+
+    send(agent_pid, :stop)
+  end
+
+  test "normal agent in review monitor state is released after grace window without workspace cleanup" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-in-review-grace-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-review-grace-expired"
+    issue_identifier = "MT-559"
+    workspace = Path.join(test_root, issue_identifier)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: test_root,
+        review_monitor_enabled: true,
+        review_monitor_states: ["In Review"],
+        in_review_grace_shutdown_ms: 1_000
+      )
+
+      File.mkdir_p!(workspace)
+
+      agent_pid =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      state = %Orchestrator.State{
+        running: %{
+          issue_id => %{
+            pid: agent_pid,
+            ref: nil,
+            worker_type: :agent,
+            identifier: issue_identifier,
+            issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
+            in_review_grace_started_at: DateTime.add(DateTime.utc_now(), -2, :second),
+            started_at: DateTime.utc_now()
+          }
+        },
+        claimed: MapSet.new([issue_id]),
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        retry_attempts: %{}
+      }
+
+      issue = %Issue{
+        id: issue_id,
+        identifier: issue_identifier,
+        state: "In Review",
+        title: "Review handoff",
+        description: "Grace window expired",
+        labels: []
+      }
+
+      updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+      refute Map.has_key?(updated_state.running, issue_id)
+      refute MapSet.member?(updated_state.claimed, issue_id)
+      refute Map.has_key?(updated_state.retry_attempts, issue_id)
+      refute Process.alive?(agent_pid)
+      assert File.exists?(workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "reconcile stops running issue when it is reassigned away from this worker" do
     issue_id = "issue-reassigned"
 

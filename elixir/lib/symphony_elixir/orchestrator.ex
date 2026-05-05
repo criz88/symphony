@@ -450,11 +450,76 @@ defmodule SymphonyElixir.Orchestrator do
   defp refresh_running_issue_state(%State{} = state, %Issue{} = issue) do
     case Map.get(state.running, issue.id) do
       %{issue: _} = running_entry ->
-        %{state | running: Map.put(state.running, issue.id, %{running_entry | issue: issue})}
+        refresh_running_issue_entry(state, issue, running_entry)
 
       _ ->
         state
     end
+  end
+
+  defp refresh_running_issue_entry(%State{} = state, %Issue{} = issue, running_entry)
+       when is_map(running_entry) do
+    if normal_agent_in_review_state?(running_entry, issue) do
+      refresh_normal_agent_in_review_state(state, issue, running_entry)
+    else
+      running_entry =
+        running_entry
+        |> Map.put(:issue, issue)
+        |> Map.delete(:in_review_grace_started_at)
+
+      put_running_entry(state, issue.id, running_entry)
+    end
+  end
+
+  defp normal_agent_in_review_state?(running_entry, %Issue{state: issue_state})
+       when is_map(running_entry) and is_binary(issue_state) do
+    !review_monitor_worker?(running_entry) and Config.review_monitor_state?(issue_state)
+  end
+
+  defp normal_agent_in_review_state?(_running_entry, _issue), do: false
+
+  defp review_monitor_worker?(%{worker_type: :review_monitor}), do: true
+  defp review_monitor_worker?(%{worker_type: "review_monitor"}), do: true
+  defp review_monitor_worker?(_running_entry), do: false
+
+  defp refresh_normal_agent_in_review_state(%State{} = state, %Issue{} = issue, running_entry) do
+    now = DateTime.utc_now()
+    grace_window_started? = match?(%DateTime{}, Map.get(running_entry, :in_review_grace_started_at))
+    grace_started_at = in_review_grace_started_at(running_entry, now)
+    elapsed_ms = max(0, DateTime.diff(now, grace_started_at, :millisecond))
+    grace_ms = Config.settings!().agent.in_review_grace_shutdown_ms
+
+    running_entry =
+      running_entry
+      |> Map.put(:issue, issue)
+      |> Map.put(:in_review_grace_started_at, grace_started_at)
+
+    state = put_running_entry(state, issue.id, running_entry)
+
+    if elapsed_ms >= grace_ms do
+      Logger.warning("Agent exceeded In Review grace window: #{issue_context(issue)} elapsed_ms=#{elapsed_ms} grace_ms=#{grace_ms}; releasing agent for review monitor")
+
+      terminate_running_issue(state, issue.id, false)
+    else
+      maybe_log_in_review_grace_start(grace_window_started?, issue, elapsed_ms, grace_ms)
+      state
+    end
+  end
+
+  defp in_review_grace_started_at(%{in_review_grace_started_at: %DateTime{} = started_at}, _now),
+    do: started_at
+
+  defp in_review_grace_started_at(_running_entry, now), do: now
+
+  defp maybe_log_in_review_grace_start(true, _issue, _elapsed_ms, _grace_ms),
+    do: :ok
+
+  defp maybe_log_in_review_grace_start(false, issue, elapsed_ms, grace_ms) do
+    Logger.info("Agent entered In Review grace window: #{issue_context(issue)} elapsed_ms=#{elapsed_ms} grace_ms=#{grace_ms}")
+  end
+
+  defp put_running_entry(%State{} = state, issue_id, running_entry) when is_binary(issue_id) do
+    %{state | running: Map.put(state.running, issue_id, running_entry)}
   end
 
   defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace) do

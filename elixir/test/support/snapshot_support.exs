@@ -55,6 +55,7 @@ defmodule SymphonyElixir.TestSupport.Snapshot do
       raw_ansi_content
       |> strip_ansi()
       |> normalize_content()
+      |> trim_trailing_spaces_per_line()
       |> String.trim_trailing("\n")
 
     "```text\n#{plain}\n```\n"
@@ -74,5 +75,11 @@ defmodule SymphonyElixir.TestSupport.Snapshot do
     |> String.replace("\r\n", "\n")
     |> String.trim_trailing("\n")
     |> Kernel.<>("\n")
+  end
+
+  defp trim_trailing_spaces_per_line(content) do
+    content
+    |> String.split("\n")
+    |> Enum.map_join("\n", &String.trim_trailing/1)
   end
 end

@@ -298,12 +298,15 @@ defmodule SymphonyElixir.ReviewMonitor do
     case run_command(runner, "prloop", args, cd: workspace, worker_host: worker_host) do
       {:ok, raw} ->
         case Jason.decode(raw) do
-          {:ok, status} -> {:ok, status}
-          {:error, reason} -> {:error, {:invalid_prloop_status_json, reason}}
+          {:ok, status} ->
+            {:ok, status}
+
+          {:error, reason} ->
+            {:blocked, "prloop status returned invalid JSON for In Review issue", %{branch: branch, pr: pr_ref, error: inspect(reason)}}
         end
 
       {:error, reason} ->
-        {:error, {:prloop_status_failed, reason}}
+        {:blocked, "prloop status failed for In Review issue", %{branch: branch, pr: pr_ref, error: inspect(reason)}}
     end
   end
 
@@ -385,7 +388,16 @@ defmodule SymphonyElixir.ReviewMonitor do
         :resumed
 
       {:error, reason} ->
-        {:error, {:tmux_start_failed, session, reason}}
+        block_issue(
+          issue,
+          "could not start detached prloop #{prloop_command} session",
+          Map.merge(evidence, %{
+            branch: branch,
+            pr: pr.ref,
+            session: session,
+            error: inspect(reason)
+          })
+        )
     end
   end
 

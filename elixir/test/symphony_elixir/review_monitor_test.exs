@@ -82,6 +82,49 @@ defmodule SymphonyElixir.ReviewMonitorTest do
     assert_receive {:memory_tracker_state_update, "issue-review", "Human Review"}
   end
 
+  test "prloop status failure moves issue to configured blocked state with a comment" do
+    issue = review_issue()
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+    write_review_monitor_workflow!()
+
+    runner =
+      runner(%{
+        {"prloop", "status"} => {:error, {:exit_status, 1, "missing prloop state"}}
+      })
+
+    assert :ok = ReviewMonitor.run(issue, self(), workspace: "/tmp/worktree", command_runner: runner)
+    assert_receive {:memory_tracker_comment, "issue-review", body}
+    assert body =~ "prloop status failed"
+    assert body =~ "missing prloop state"
+    assert body =~ "feature/doc-123"
+    assert_receive {:memory_tracker_state_update, "issue-review", "Human Review"}
+  end
+
+  test "tmux start failure moves issue to configured blocked state with a comment" do
+    issue = review_issue()
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+    write_review_monitor_workflow!()
+
+    runner =
+      runner(%{
+        {"prloop", "status"} =>
+          Jason.encode!(%{
+            "run" => %{"state" => "running", "recommendedAction" => "resume", "resumable" => true},
+            "statePath" => "/tmp/state.json",
+            "logDir" => "/tmp/logs"
+          }),
+        {"tmux", "has-session"} => {:error, {:exit_status, 1, ""}},
+        {"tmux", "new-session"} => {:error, {:exit_status, 1, "tmux unavailable"}}
+      })
+
+    assert :ok = ReviewMonitor.run(issue, self(), workspace: "/tmp/worktree", command_runner: runner)
+    assert_receive {:memory_tracker_comment, "issue-review", body}
+    assert body =~ "could not start detached prloop resume session"
+    assert body =~ "tmux unavailable"
+    assert body =~ "prloop-doc-doc-123-pr-42"
+    assert_receive {:memory_tracker_state_update, "issue-review", "Human Review"}
+  end
+
   test "manual reconciliation status moves issue to configured blocked state with evidence" do
     issue = review_issue()
     Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
