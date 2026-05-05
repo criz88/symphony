@@ -103,6 +103,10 @@ defmodule SymphonyElixir.TestSupport do
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
           worker_ssh_hosts: [],
           worker_max_concurrent_agents_per_host: nil,
+          review_monitor_enabled: false,
+          review_monitor_states: [],
+          review_monitor_clean_state: "Merging",
+          review_monitor_blocked_state: "Human Review",
           max_concurrent_agents: 10,
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
@@ -140,6 +144,10 @@ defmodule SymphonyElixir.TestSupport do
     workspace_root = Keyword.get(config, :workspace_root)
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
     worker_max_concurrent_agents_per_host = Keyword.get(config, :worker_max_concurrent_agents_per_host)
+    review_monitor_enabled = Keyword.get(config, :review_monitor_enabled)
+    review_monitor_states = Keyword.get(config, :review_monitor_states)
+    review_monitor_clean_state = Keyword.get(config, :review_monitor_clean_state)
+    review_monitor_blocked_state = Keyword.get(config, :review_monitor_blocked_state)
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
@@ -179,6 +187,12 @@ defmodule SymphonyElixir.TestSupport do
         "workspace:",
         "  root: #{yaml_value(workspace_root)}",
         worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),
+        review_monitor_yaml(
+          review_monitor_enabled,
+          review_monitor_states,
+          review_monitor_clean_state,
+          review_monitor_blocked_state
+        ),
         "agent:",
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
         "  max_turns: #{yaml_value(max_turns)}",
@@ -252,6 +266,19 @@ defmodule SymphonyElixir.TestSupport do
         "  max_concurrent_agents_per_host: #{yaml_value(max_concurrent_agents_per_host)}"
     ]
     |> Enum.reject(&(&1 in [nil, false]))
+    |> Enum.join("\n")
+  end
+
+  defp review_monitor_yaml(false, [], "Merging", "Human Review"), do: nil
+
+  defp review_monitor_yaml(enabled, states, clean_state, blocked_state) do
+    [
+      "review_monitor:",
+      "  enabled: #{yaml_value(enabled)}",
+      "  states: #{yaml_value(states)}",
+      "  clean_state: #{yaml_value(clean_state)}",
+      "  blocked_state: #{yaml_value(blocked_state)}"
+    ]
     |> Enum.join("\n")
   end
 

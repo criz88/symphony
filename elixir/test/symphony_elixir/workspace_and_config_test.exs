@@ -743,6 +743,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.tracker.project_slug == nil
     assert config.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
     assert config.worker.max_concurrent_agents_per_host == nil
+    refute config.review_monitor.enabled
+    assert config.review_monitor.states == []
+    assert config.review_monitor.clean_state == "Merging"
+    assert config.review_monitor.blocked_state == "Human Review"
     assert config.agent.max_concurrent_agents == 10
     assert config.codex.command == "codex app-server"
 
@@ -821,6 +825,26 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     write_workflow_file!(Workflow.workflow_file_path(), worker_max_concurrent_agents_per_host: 0)
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "worker.max_concurrent_agents_per_host"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      review_monitor_enabled: true,
+      review_monitor_states: ["In Review"],
+      review_monitor_clean_state: "Merging",
+      review_monitor_blocked_state: "Human Review"
+    )
+
+    assert :ok = Config.validate!()
+    assert Config.settings!().review_monitor.enabled
+    assert Config.review_monitor_states() == ["In Review"]
+    assert Config.review_monitor_state?(" in review ")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      review_monitor_enabled: true,
+      review_monitor_states: [""]
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "review_monitor.states"
 
     write_workflow_file!(Workflow.workflow_file_path(), codex_turn_timeout_ms: "bad")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()

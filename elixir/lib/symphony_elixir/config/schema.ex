@@ -119,6 +119,48 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule ReviewMonitor do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:enabled, :boolean, default: false)
+      field(:states, {:array, :string}, default: [])
+      field(:clean_state, :string, default: "Merging")
+      field(:blocked_state, :string, default: "Human Review")
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:enabled, :states, :clean_state, :blocked_state], empty_values: [])
+      |> update_change(:states, &normalize_states/1)
+      |> validate_monitor_states()
+      |> validate_required([:clean_state, :blocked_state])
+    end
+
+    defp normalize_states(states) when is_list(states) do
+      Enum.map(states, fn
+        state when is_binary(state) -> String.trim(state)
+        state -> state
+      end)
+    end
+
+    defp normalize_states(states), do: states
+
+    defp validate_monitor_states(changeset) do
+      validate_change(changeset, :states, fn :states, states ->
+        if Enum.any?(states, &(is_binary(&1) and String.trim(&1) == "")) do
+          [states: "state names must not be blank"]
+        else
+          []
+        end
+      end)
+    end
+  end
+
   defmodule Agent do
     @moduledoc false
     use Ecto.Schema
@@ -266,6 +308,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:polling, Polling, on_replace: :update, defaults_to_struct: true)
     embeds_one(:workspace, Workspace, on_replace: :update, defaults_to_struct: true)
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:review_monitor, ReviewMonitor, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
@@ -358,6 +401,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:polling, with: &Polling.changeset/2)
     |> cast_embed(:workspace, with: &Workspace.changeset/2)
     |> cast_embed(:worker, with: &Worker.changeset/2)
+    |> cast_embed(:review_monitor, with: &ReviewMonitor.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)

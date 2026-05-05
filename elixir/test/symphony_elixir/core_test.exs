@@ -544,14 +544,98 @@ defmodule SymphonyElixir.CoreTest do
     end)
 
     send(pid, {:DOWN, ref, :process, self(), :normal})
+    {retry_entry, state} = wait_for_retry_entry(pid, issue_id)
+
+    refute Map.has_key?(state.running, issue_id)
+    assert MapSet.member?(state.completed, issue_id)
+    assert %{attempt: 1, due_at_ms: due_at_ms} = retry_entry
+    assert is_integer(due_at_ms)
+    assert_due_in_range(due_at_ms, 500, 1_100)
+  end
+
+  test "review monitor exit releases claim without active-state continuation retry" do
+    issue_id = "issue-review-monitor"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :ReviewMonitorExitOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      worker_type: :review_monitor,
+      identifier: "MT-562",
+      issue: %Issue{id: issue_id, identifier: "MT-562", state: "In Review"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
     Process.sleep(50)
     state = :sys.get_state(pid)
 
     refute Map.has_key?(state.running, issue_id)
-    assert MapSet.member?(state.completed, issue_id)
-    assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
-    assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    refute MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+  end
+
+  test "in review issue dispatches to review monitor instead of agent runner" do
+    parent = self()
+    Application.put_env(:symphony_elixir, :core_test_recipient, parent)
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :core_test_recipient)
+    end)
+
+    issue = %Issue{
+      id: "issue-in-review",
+      identifier: "MT-563",
+      title: "Monitor review",
+      state: "In Review",
+      assigned_to_worker: true
+    }
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress"],
+      review_monitor_enabled: true,
+      review_monitor_states: ["In Review"],
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    orchestrator_name = Module.concat(__MODULE__, :ReviewMonitorDispatchOrchestrator)
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: orchestrator_name,
+        agent_runner: SymphonyElixir.CoreTest.FakeAgentRunner,
+        review_monitor: SymphonyElixir.CoreTest.FakeReviewMonitor
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    assert_receive {:fake_review_monitor_run, "issue-in-review", opts}, 1_000
+    assert Keyword.get(opts, :worker_host) == nil
+    refute_received {:fake_agent_runner_run, _issue_id, _opts}
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -585,11 +669,10 @@ defmodule SymphonyElixir.CoreTest do
     end)
 
     send(pid, {:DOWN, ref, :process, self(), :boom})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
+    {retry_entry, _state} = wait_for_retry_entry(pid, issue_id)
 
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
-             state.retry_attempts[issue_id]
+             retry_entry
 
     assert_due_in_range(due_at_ms, 39_500, 40_500)
   end
@@ -624,11 +707,10 @@ defmodule SymphonyElixir.CoreTest do
     end)
 
     send(pid, {:DOWN, ref, :process, self(), :boom})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
+    {retry_entry, _state} = wait_for_retry_entry(pid, issue_id)
 
     assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
-             state.retry_attempts[issue_id]
+             retry_entry
 
     assert_due_in_range(due_at_ms, 9_000, 10_500)
   end
@@ -755,6 +837,28 @@ defmodule SymphonyElixir.CoreTest do
 
     assert remaining_ms >= min_remaining_ms
     assert remaining_ms <= max_remaining_ms
+  end
+
+  defp wait_for_retry_entry(pid, issue_id, deadline_ms \\ 1_000) do
+    deadline = System.monotonic_time(:millisecond) + deadline_ms
+    do_wait_for_retry_entry(pid, issue_id, deadline)
+  end
+
+  defp do_wait_for_retry_entry(pid, issue_id, deadline) do
+    state = :sys.get_state(pid)
+
+    case Map.get(state.retry_attempts, issue_id) do
+      nil ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          flunk("timed out waiting for retry entry #{issue_id}")
+        else
+          Process.sleep(5)
+          do_wait_for_retry_entry(pid, issue_id, deadline)
+        end
+
+      retry_entry ->
+        {retry_entry, state}
+    end
   end
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
@@ -1815,5 +1919,24 @@ defmodule SymphonyElixir.CoreTest do
     after
       File.rm_rf(test_root)
     end
+  end
+end
+
+defmodule SymphonyElixir.CoreTest.FakeAgentRunner do
+  @moduledoc false
+
+  def run(%SymphonyElixir.Linear.Issue{id: issue_id}, _recipient, opts) do
+    send(Application.fetch_env!(:symphony_elixir, :core_test_recipient), {:fake_agent_runner_run, issue_id, opts})
+    :ok
+  end
+end
+
+defmodule SymphonyElixir.CoreTest.FakeReviewMonitor do
+  @moduledoc false
+
+  def run(%SymphonyElixir.Linear.Issue{id: issue_id}, recipient, opts) do
+    send(Application.fetch_env!(:symphony_elixir, :core_test_recipient), {:fake_review_monitor_run, issue_id, opts})
+    send(recipient, {:review_monitor_result, issue_id, :waiting})
+    :ok
   end
 end
