@@ -98,6 +98,7 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  in_review_grace_shutdown_ms: 120000
 codex:
   command: codex app-server
 ---
@@ -121,6 +122,10 @@ Notes:
   Symphony validation.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- `agent.in_review_grace_shutdown_ms` controls how long a normal agent may keep running after
+  its issue reaches a configured review-monitor state such as `In Review`. After this grace window,
+  Symphony releases the normal agent without cleaning the workspace so the review monitor can own
+  the issue. Default: `120000`.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run

@@ -748,6 +748,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.review_monitor.clean_state == "Merging"
     assert config.review_monitor.blocked_state == "Human Review"
     assert config.agent.max_concurrent_agents == 10
+    assert config.agent.in_review_grace_shutdown_ms == 120_000
     assert config.codex.command == "codex app-server"
 
     assert config.codex.approval_policy == %{
@@ -822,6 +823,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "agent.max_concurrent_agents"
 
+    write_workflow_file!(Workflow.workflow_file_path(), in_review_grace_shutdown_ms: "bad")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.in_review_grace_shutdown_ms"
+
     write_workflow_file!(Workflow.workflow_file_path(), worker_max_concurrent_agents_per_host: 0)
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "worker.max_concurrent_agents_per_host"
@@ -837,6 +842,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.settings!().review_monitor.enabled
     assert Config.review_monitor_states() == ["In Review"]
     assert Config.review_monitor_state?(" in review ")
+
+    write_workflow_file!(Workflow.workflow_file_path(), in_review_grace_shutdown_ms: 1_500)
+    assert Config.settings!().agent.in_review_grace_shutdown_ms == 1_500
 
     write_workflow_file!(Workflow.workflow_file_path(),
       review_monitor_enabled: true,

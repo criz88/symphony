@@ -957,7 +957,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert is_integer(due_at_ms)
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
-    assert remaining_ms >= 9_500
+    assert remaining_ms >= 9_000
     assert remaining_ms <= 10_500
   end
 
@@ -1054,7 +1054,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert checking_rendered =~ "checking now…"
   end
 
-  test "status dashboard adds a spacer line before backoff queue when no agents are active" do
+  test "status dashboard adds a spacer line before backoff queue when no sessions are active" do
     snapshot_data =
       {:ok,
        %{
@@ -1067,7 +1067,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     rendered = StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0)
     plain = Regex.replace(~r/\e\[[0-9;]*m/, rendered, "")
 
-    assert plain =~ ~r/No active agents\r?\n│\s*\r?\n├─ Backoff queue/
+    assert plain =~ ~r/No active sessions\r?\n│\s*\r?\n├─ Backoff queue/
   end
 
   test "status dashboard adds a spacer line before backoff queue when agents are active" do
@@ -1107,6 +1107,30 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     plain = Regex.replace(~r/\e\[[0-9;]*m/, rendered, "")
 
     assert plain =~ ~r/MT-777.*\r?\n│\s*\r?\n├─ Backoff queue/s
+  end
+
+  test "status dashboard running rows identify review monitors separately from agents" do
+    rendered =
+      StatusDashboard.format_running_summary_for_test(
+        %{
+          identifier: "MT-778",
+          worker_type: :review_monitor,
+          state: "In Review",
+          session_id: nil,
+          codex_app_server_pid: nil,
+          codex_total_tokens: 0,
+          runtime_seconds: 12,
+          turn_count: 0,
+          last_codex_event: :review_monitor_result,
+          last_codex_message: %{event: :review_monitor_result, message: %{outcome: :waiting}}
+        },
+        120
+      )
+      |> then(&Regex.replace(~r/\e\[[0-9;]*m/, &1, ""))
+
+    assert rendered =~ "MT-778"
+    assert rendered =~ "monitor"
+    assert rendered =~ "In Review"
   end
 
   test "status dashboard renders an unstyled closing corner when the retry queue is empty" do

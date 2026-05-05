@@ -423,6 +423,12 @@ Fields:
   - Default: empty map.
   - State keys are normalized (`lowercase`) for lookup.
   - Invalid entries (non-positive or non-numeric) are ignored.
+- `in_review_grace_shutdown_ms` (integer)
+  - Default: `120000` (2 minutes)
+  - When a normal agent-owned running issue is refreshed into a configured review monitor state,
+    the orchestrator SHOULD allow this grace window for final handoff evidence and final response.
+  - After the grace window elapses, the orchestrator SHOULD terminate and release the normal agent
+    without cleaning the workspace so a review monitor can claim the issue.
 
 #### 5.3.6 `codex` (object)
 
@@ -587,6 +593,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
+- `agent.in_review_grace_shutdown_ms`: integer, default `120000` (2m)
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
@@ -793,6 +800,9 @@ Part B: Tracker state refresh
 - Fetch current issue states for all running issue IDs.
 - For each running issue:
   - If tracker state is terminal: terminate worker and clean workspace.
+  - If a normal agent-owned issue moved into a configured review monitor state: start or continue
+    an `agent.in_review_grace_shutdown_ms` grace window; once elapsed, terminate and release the
+    normal agent without workspace cleanup so the review monitor can claim the issue.
   - If tracker state is still active: update the in-memory issue snapshot.
   - If tracker state is neither active nor terminal: terminate worker without workspace cleanup.
 - If state refresh fails, keep workers running and try again on the next tick.
@@ -1986,6 +1996,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Terminal state stops running agent and cleans workspace
 - Reconciliation with no running issues is a no-op
 - Normal worker exit schedules a short continuation retry (attempt 1)
+- Normal agent in a configured review monitor state is released after the In Review grace window
 - Abnormal worker exit increments retries with 10s-based exponential backoff
 - Retry backoff cap uses configured `agent.max_retry_backoff_ms`
 - Retry queue entries include attempt, due time, identifier, and error

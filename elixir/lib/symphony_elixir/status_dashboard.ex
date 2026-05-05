@@ -16,6 +16,7 @@ defmodule SymphonyElixir.StatusDashboard do
   @throughput_graph_columns 24
   @sparkline_blocks ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
   @running_id_width 8
+  @running_worker_width 8
   @running_stage_width 14
   @running_pid_width 8
   @running_age_width 12
@@ -23,7 +24,7 @@ defmodule SymphonyElixir.StatusDashboard do
   @running_session_width 14
   @running_event_default_width 44
   @running_event_min_width 12
-  @running_row_chrome_width 10
+  @running_row_chrome_width 11
   @default_terminal_columns 115
 
   @ansi_reset IO.ANSI.reset()
@@ -340,7 +341,9 @@ defmodule SymphonyElixir.StatusDashboard do
         codex_output_tokens = Map.get(codex_totals, :output_tokens, 0)
         codex_total_tokens = Map.get(codex_totals, :total_tokens, 0)
         codex_seconds_running = Map.get(codex_totals, :seconds_running, 0)
-        agent_count = length(running)
+        session_count = length(running)
+        normal_agent_count = running_worker_count(running, :agent)
+        review_monitor_count = running_worker_count(running, :review_monitor)
         max_agents = Config.settings!().agent.max_concurrent_agents
         running_event_width = running_event_width(terminal_columns_override)
         running_rows = format_running_rows(running, running_event_width)
@@ -349,10 +352,14 @@ defmodule SymphonyElixir.StatusDashboard do
 
         ([
            colorize("╭─ SYMPHONY STATUS", @ansi_bold),
-           colorize("│ Agents: ", @ansi_bold) <>
-             colorize("#{agent_count}", @ansi_green) <>
+           colorize("│ Sessions: ", @ansi_bold) <>
+             colorize("#{session_count}", @ansi_green) <>
              colorize("/", @ansi_gray) <>
-             colorize("#{max_agents}", @ansi_gray),
+             colorize("#{max_agents}", @ansi_gray) <>
+             colorize(" | Agents: ", @ansi_bold) <>
+             colorize("#{normal_agent_count}", @ansi_green) <>
+             colorize(" | Monitors: ", @ansi_bold) <>
+             colorize("#{review_monitor_count}", @ansi_cyan),
            colorize("│ Throughput: ", @ansi_bold) <> colorize("#{format_tps(tps)} tps", @ansi_cyan),
            colorize("│ Runtime: ", @ansi_bold) <>
              colorize(format_runtime_seconds(codex_seconds_running), @ansi_magenta),
@@ -576,7 +583,7 @@ defmodule SymphonyElixir.StatusDashboard do
   defp format_running_rows(running, running_event_width) do
     if running == [] do
       [
-        "│  " <> colorize("No active agents", @ansi_gray),
+        "│  " <> colorize("No active sessions", @ansi_gray),
         "│"
       ]
     else
@@ -586,9 +593,31 @@ defmodule SymphonyElixir.StatusDashboard do
     end
   end
 
+  defp running_worker_count(running, worker_type) when is_list(running) do
+    Enum.count(running, fn entry ->
+      entry
+      |> Map.get(:worker_type, :agent)
+      |> normalized_worker_type()
+      |> Kernel.==(worker_type)
+    end)
+  end
+
+  defp normalized_worker_type(:review_monitor), do: :review_monitor
+  defp normalized_worker_type("review_monitor"), do: :review_monitor
+  defp normalized_worker_type(_worker_type), do: :agent
+
+  defp worker_type_label(:review_monitor), do: "monitor"
+  defp worker_type_label("review_monitor"), do: "monitor"
+  defp worker_type_label(_worker_type), do: "agent"
+
+  defp worker_type_color("monitor"), do: @ansi_cyan
+  defp worker_type_color(_worker_type), do: @ansi_green
+
   # credo:disable-for-next-line
   defp format_running_summary(running_entry, running_event_width) do
     issue = format_cell(running_entry.identifier || "unknown", @running_id_width)
+    worker_type = running_entry |> Map.get(:worker_type, :agent) |> worker_type_label()
+    worker = format_cell(worker_type, @running_worker_width)
     state = running_entry.state || "unknown"
     state_display = format_cell(to_string(state), @running_stage_width)
     session = running_entry.session_id |> compact_session_id() |> format_cell(@running_session_width)
@@ -616,6 +645,8 @@ defmodule SymphonyElixir.StatusDashboard do
       status_dot(status_color),
       " ",
       colorize(issue, @ansi_cyan),
+      " ",
+      colorize(worker, worker_type_color(worker_type)),
       " ",
       colorize(state_display, status_color),
       " ",
@@ -740,6 +771,7 @@ defmodule SymphonyElixir.StatusDashboard do
     header =
       [
         format_cell("ID", @running_id_width),
+        format_cell("WORKER", @running_worker_width),
         format_cell("STAGE", @running_stage_width),
         format_cell("PID", @running_pid_width),
         format_cell("AGE / TURN", @running_age_width),
@@ -755,12 +787,13 @@ defmodule SymphonyElixir.StatusDashboard do
   defp running_table_separator_row(running_event_width) do
     separator_width =
       @running_id_width +
+        @running_worker_width +
         @running_stage_width +
         @running_pid_width +
         @running_age_width +
         @running_tokens_width +
         @running_session_width +
-        running_event_width + 6
+        running_event_width + 7
 
     "│   " <> colorize(String.duplicate("─", separator_width), @ansi_gray)
   end
@@ -776,6 +809,7 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp fixed_running_width do
     @running_id_width +
+      @running_worker_width +
       @running_stage_width +
       @running_pid_width +
       @running_age_width +

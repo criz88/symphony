@@ -1,6 +1,6 @@
 ```text
 ╭─ SYMPHONY STATUS
-│ Agents: 0/10
+│ Sessions: 0/10 | Agents: 0 | Monitors: 0
 │ Throughput: 0 tps
 │ Runtime: 0m 0s
 │ Tokens: in 0 | out 0 | total 0
@@ -10,9 +10,9 @@
 │ Next refresh: n/a
 ├─ Running
 │
-│   ID       STAGE          PID      AGE / TURN   TOKENS     SESSION        EVENT                                  
+│   ID       WORKER   STAGE          PID      AGE / TURN   TOKENS     SESSION        EVENT
 │   ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
-│  No active agents
+│  No active sessions
 │
 ├─ Backoff queue
 │
