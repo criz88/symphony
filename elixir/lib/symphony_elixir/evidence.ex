@@ -127,8 +127,8 @@ defmodule SymphonyElixir.Evidence do
       redaction_status = Map.get(event, "redaction_status", "not_needed")
 
       with :ok <- append_jsonl(Path.join(context.session_dir, "events.jsonl"), event),
-           {:ok, context} <- mark_artifact_captured(context, :events, "events.jsonl", "symphony", %{}, opts) do
-        maybe_mark_redacted(context, redaction_status, opts)
+           {:ok, context} <- maybe_mark_redacted(context, redaction_status, opts) do
+        {:ok, context}
       end
     end
   end
@@ -158,9 +158,8 @@ defmodule SymphonyElixir.Evidence do
         })
 
       with :ok <- append_jsonl(Path.join(context.session_dir, "validation.jsonl"), entry),
-           {:ok, context} <-
-             mark_artifact_captured(context, :validation, "validation.jsonl", "symphony", %{}, opts) do
-        maybe_mark_redacted(context, redaction_status, opts)
+           {:ok, context} <- maybe_mark_redacted(context, redaction_status, opts) do
+        {:ok, context}
       end
     end
   end
@@ -179,17 +178,14 @@ defmodule SymphonyElixir.Evidence do
         |> Map.merge(stringify_keys(summary))
         |> Map.put_new("trust_level", "machine_captured")
 
-      with :ok <- write_json_file(Path.join(context.session_dir, "git.json"), entry) do
-        update_manifest(
-          context,
-          %{
-            branch: value(summary, :branch),
-            commit: value(summary, :commit),
-            artifact_paths: %{git: "git.json"},
-            artifacts: %{git: artifact_status("captured", "git", nil, "git.json")}
-          },
-          opts
-        )
+      with :ok <- write_json_file(Path.join(context.session_dir, "git.json"), entry),
+           {:ok, context} <-
+             update_manifest(
+               context,
+               %{branch: value(summary, :branch), commit: value(summary, :commit)},
+               opts
+             ) do
+        {:ok, context}
       end
     end
   end
@@ -304,7 +300,7 @@ defmodule SymphonyElixir.Evidence do
 
     result =
       with :ok <- maybe_write_git_summary(context, git_result, opts),
-           :ok <- harvest_prloop(context, workspace, opts),
+           :ok <- harvest_prloop(context, workspace),
            {:ok, _context} <-
              append_event(
                context,
@@ -382,17 +378,15 @@ defmodule SymphonyElixir.Evidence do
 
   defp maybe_write_git_summary(_context, {:error, _reason}, _opts), do: :ok
 
-  defp harvest_prloop(context, workspace, opts) do
+  defp harvest_prloop(context, workspace) do
     prloop_root = Path.join([workspace, ".git", "cloud-review-loop"])
 
     if File.exists?(prloop_root) do
       destination = Path.join(context.session_dir, "prloop")
 
       with :ok <- File.mkdir_p(destination),
-           metadata <- prloop_metadata(prloop_root),
-           {:ok, log_artifact} <- copy_prloop_logs(prloop_root, destination, metadata),
-           {:ok, state_artifact} <- copy_prloop_state(context, prloop_root, destination, metadata),
-           {:ok, _context} <- update_prloop_manifest(context, state_artifact, log_artifact, opts) do
+           :ok <- copy_prloop_state(prloop_root, destination),
+           :ok <- copy_prloop_logs(prloop_root, destination) do
         :ok
       end
     else
@@ -400,33 +394,22 @@ defmodule SymphonyElixir.Evidence do
     end
   end
 
-  defp copy_prloop_state(context, prloop_root, destination, metadata) do
-    case select_prloop_state_source(context, prloop_root, metadata) do
-      {:ok, source, discovery} ->
-        with :ok <- copy_file(source, Path.join(destination, "state.json")) do
-          {:ok,
-           %{
-             status: "captured",
-             path: "prloop/state.json",
-             source: "prloop",
-             source_path: source,
-             discovery: discovery
-           }}
-        end
+  defp copy_prloop_state(prloop_root, destination) do
+    source = Path.join(prloop_root, "state.json")
 
-      {:missing, reason, details} ->
-        {:ok,
-         %{
-           status: "missing",
-           path: nil,
-           source: "prloop",
-           reason: reason,
-           details: details
-         }}
+    cond do
+      File.regular?(source) ->
+        copy_file(source, Path.join(destination, "state.json"))
+
+      File.exists?(source) ->
+        {:error, {:prloop_state_not_regular, source}}
+
+      true ->
+        :ok
     end
   end
 
-  defp copy_prloop_logs(prloop_root, destination, metadata) do
+  defp copy_prloop_logs(prloop_root, destination) do
     source = Path.join(prloop_root, "tmux")
     target = Path.join(destination, "logs")
 
@@ -434,13 +417,7 @@ defmodule SymphonyElixir.Evidence do
       File.dir?(source) ->
         with {:ok, _removed} <- File.rm_rf(target),
              {:ok, _copied} <- File.cp_r(source, target) do
-          {:ok,
-           %{
-             status: "captured",
-             path: "prloop/logs",
-             source: "prloop",
-             source_path: preferred_log_dir(metadata, source)
-           }}
+          :ok
         else
           {:error, reason, file} -> {:error, {:prloop_logs_copy_failed, file, reason}}
           {:error, reason} -> {:error, {:prloop_logs_copy_failed, source, reason}}
@@ -450,247 +427,8 @@ defmodule SymphonyElixir.Evidence do
         {:error, {:prloop_logs_not_directory, source}}
 
       true ->
-        {:ok,
-         %{
-           status: "not_applicable",
-           path: nil,
-           source: "prloop",
-           reason: "prloop_logs_not_present"
-         }}
+        :ok
     end
-  end
-
-  defp update_prloop_manifest(context, state_artifact, log_artifact, opts) do
-    artifact_paths =
-      %{}
-      |> maybe_put_artifact_path(:prloop_state, state_artifact)
-      |> maybe_put_artifact_path(:prloop_log_dir, log_artifact)
-
-    attrs =
-      %{
-        artifact_paths: artifact_paths,
-        artifacts: %{
-          prloop_state: artifact_status(state_artifact),
-          prloop_log_dir: artifact_status(log_artifact)
-        }
-      }
-      |> maybe_put_context(:prloop_state_path, Map.get(state_artifact, :source_path))
-      |> maybe_put_context(:prloop_log_dir, Map.get(log_artifact, :source_path))
-
-    update_manifest(context, attrs, opts)
-  end
-
-  defp select_prloop_state_source(context, prloop_root, metadata) do
-    candidates =
-      []
-      |> add_state_candidate(:context_prloop_state_path, value(context, :prloop_state_path), prloop_root)
-      |> add_state_candidates(:log_state_path, Map.get(metadata, :state_paths, []), prloop_root)
-      |> add_state_candidate(:legacy_flat_state, Path.join(prloop_root, "state.json"), prloop_root)
-
-    case Enum.find(candidates, fn {_discovery, path} -> File.regular?(path) end) do
-      {discovery, path} ->
-        {:ok, path, Atom.to_string(discovery)}
-
-      nil ->
-        select_nested_prloop_state(prloop_root, candidates)
-    end
-  end
-
-  defp add_state_candidates(candidates, discovery, paths, prloop_root) when is_list(paths) do
-    Enum.reduce(paths, candidates, fn path, acc ->
-      add_state_candidate(acc, discovery, path, prloop_root)
-    end)
-  end
-
-  defp add_state_candidate(candidates, _discovery, nil, _prloop_root), do: candidates
-  defp add_state_candidate(candidates, _discovery, "", _prloop_root), do: candidates
-
-  defp add_state_candidate(candidates, discovery, path, prloop_root) when is_binary(path) do
-    case normalize_prloop_path(path, prloop_root) do
-      nil -> candidates
-      normalized -> candidates ++ [{discovery, normalized}]
-    end
-  end
-
-  defp select_nested_prloop_state(prloop_root, checked_candidates) do
-    paths =
-      prloop_root
-      |> Path.join("state/*/state.json")
-      |> Path.wildcard()
-      |> Enum.filter(&File.regular?/1)
-
-    case newest_unambiguous_path(paths) do
-      {:ok, path} ->
-        {:ok, path, "nested_state_search"}
-
-      {:ambiguous, candidate_paths} ->
-        {:missing, "ambiguous_prloop_state_candidates", %{candidate_paths: candidate_paths}}
-
-      :none ->
-        {:missing, "prloop_state_not_found", %{checked_paths: Enum.map(checked_candidates, &elem(&1, 1))}}
-    end
-  end
-
-  defp newest_unambiguous_path([]), do: :none
-
-  defp newest_unambiguous_path(paths) do
-    candidates =
-      paths
-      |> Enum.flat_map(fn path ->
-        case File.stat(path, time: :posix) do
-          {:ok, stat} -> [{path, stat.mtime}]
-          {:error, _reason} -> []
-        end
-      end)
-      |> Enum.sort_by(fn {_path, mtime} -> mtime end, :desc)
-
-    case candidates do
-      [] ->
-        :none
-
-      candidates ->
-        select_newest_candidate(candidates)
-    end
-  end
-
-  defp select_newest_candidate([{path, newest_mtime} | older] = candidates) do
-    if Enum.any?(older, fn {_other_path, mtime} -> mtime == newest_mtime end) do
-      {:ambiguous, Enum.map(candidates, &elem(&1, 0))}
-    else
-      {:ok, path}
-    end
-  end
-
-  defp normalize_prloop_path(path, prloop_root) when is_binary(path) do
-    expanded =
-      if Path.type(path) == :absolute do
-        Path.expand(path)
-      else
-        Path.expand(path, prloop_root)
-      end
-
-    prloop_root = Path.expand(prloop_root)
-
-    if path_inside?(expanded, prloop_root), do: expanded
-  end
-
-  defp path_inside?(path, root) do
-    relative = Path.relative_to(path, root)
-    relative != ".." and not String.starts_with?(relative, "../")
-  end
-
-  defp prloop_metadata(prloop_root) do
-    log_root = Path.join(prloop_root, "tmux")
-
-    if File.dir?(log_root) do
-      log_root
-      |> Path.join("**/*")
-      |> Path.wildcard()
-      |> Enum.filter(&File.regular?/1)
-      |> Enum.reduce(%{state_paths: [], log_dirs: []}, &collect_prloop_metadata/2)
-    else
-      %{state_paths: [], log_dirs: []}
-    end
-  end
-
-  defp collect_prloop_metadata(path, metadata) do
-    case File.read(path) do
-      {:ok, content} ->
-        metadata
-        |> append_metadata_values(:state_paths, extract_json_string_field(content, "statePath"))
-        |> append_metadata_values(:state_paths, extract_json_string_field(content, "state_path"))
-        |> append_metadata_values(:log_dirs, extract_json_string_field(content, "logDir"))
-        |> append_metadata_values(:log_dirs, extract_json_string_field(content, "log_dir"))
-
-      {:error, _reason} ->
-        metadata
-    end
-  end
-
-  defp append_metadata_values(metadata, key, values) do
-    Map.update!(metadata, key, fn existing ->
-      Enum.uniq(existing ++ values)
-    end)
-  end
-
-  defp extract_json_string_field(content, field) do
-    regex = Regex.compile!(~s/"#{Regex.escape(field)}"\\s*:\\s*("(?:[^"\\\\]|\\\\.)*")/)
-
-    regex
-    |> Regex.scan(content, capture: :all_but_first)
-    |> Enum.flat_map(fn [encoded] ->
-      case Jason.decode(encoded) do
-        {:ok, value} when is_binary(value) -> [value]
-        _other -> []
-      end
-    end)
-  end
-
-  defp preferred_log_dir(metadata, fallback) do
-    metadata
-    |> Map.get(:log_dirs, [])
-    |> Enum.find(&is_binary/1)
-    |> case do
-      nil -> fallback
-      path -> path
-    end
-  end
-
-  defp mark_artifact_captured(context, name, path, source, metadata, opts) do
-    update_manifest(
-      context,
-      %{
-        artifact_paths: %{name => path},
-        artifacts: %{name => artifact_status("captured", source, nil, path, metadata)}
-      },
-      opts
-    )
-  end
-
-  defp maybe_put_artifact_path(paths, key, %{status: "captured", path: path}) when is_binary(path) do
-    Map.put(paths, key, path)
-  end
-
-  defp maybe_put_artifact_path(paths, _key, _artifact), do: paths
-
-  defp initial_artifact_statuses do
-    %{
-      events: artifact_status("missing", "symphony", "events_not_written_yet", "events.jsonl"),
-      codex_session: artifact_status("not_applicable", "codex", "not_captured_by_cleanup_preflight", nil),
-      validation: artifact_status("not_applicable", "symphony", "not_captured_by_cleanup_preflight", nil),
-      git: artifact_status("missing", "git", "git_summary_not_captured_yet", "git.json"),
-      pr: artifact_status("not_applicable", "github", "not_captured_by_cleanup_preflight", nil),
-      ci: artifact_status("not_applicable", "ci", "not_captured_by_cleanup_preflight", nil),
-      linear: artifact_status("not_applicable", "linear", "not_captured_by_cleanup_preflight", nil),
-      prloop_state: artifact_status("not_applicable", "prloop", "prloop_not_harvested", nil),
-      prloop_log_dir: artifact_status("not_applicable", "prloop", "prloop_not_harvested", nil)
-    }
-  end
-
-  defp artifact_status(artifact) when is_map(artifact) do
-    artifact_status(
-      Map.fetch!(artifact, :status),
-      Map.fetch!(artifact, :source),
-      Map.get(artifact, :reason),
-      Map.get(artifact, :path),
-      %{
-        source_path: Map.get(artifact, :source_path),
-        discovery: Map.get(artifact, :discovery),
-        details: Map.get(artifact, :details)
-      }
-    )
-  end
-
-  defp artifact_status(status, source, reason, path, metadata \\ %{}) do
-    %{
-      status: status,
-      source: source,
-      reason: reason,
-      path: path,
-      source_path: Map.get(metadata, :source_path),
-      discovery: Map.get(metadata, :discovery),
-      details: Map.get(metadata, :details)
-    }
   end
 
   defp copy_file(source, target) do
@@ -760,8 +498,17 @@ defmodule SymphonyElixir.Evidence do
       started_at: context.captured_at,
       ended_at: nil,
       outcome: "running",
-      artifact_paths: %{},
-      artifacts: initial_artifact_statuses(),
+      artifact_paths: %{
+        events: "events.jsonl",
+        codex_session: "codex-session.jsonl",
+        validation: "validation.jsonl",
+        git: "git.json",
+        pr: "pr.json",
+        ci: "ci.json",
+        linear: "linear.json",
+        prloop_state: context.prloop_state_path,
+        prloop_log_dir: context.prloop_log_dir
+      },
       last_error: nil,
       redaction_status: "not_needed"
     }
