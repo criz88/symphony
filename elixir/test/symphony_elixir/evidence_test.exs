@@ -30,9 +30,15 @@ defmodule SymphonyElixir.EvidenceTest do
       assert manifest["issue_id"] == nil
       assert Map.has_key?(manifest, "workpad_comment_id")
       assert manifest["workpad_comment_id"] == nil
-      assert manifest["artifact_paths"]["events"] == "events.jsonl"
-      assert manifest["artifact_paths"]["validation"] == "validation.jsonl"
-      assert manifest["artifact_paths"]["git"] == "git.json"
+      assert manifest["artifact_paths"] == %{}
+      assert manifest["artifacts"]["events"]["status"] == "missing"
+      assert manifest["artifacts"]["events"]["path"] == "events.jsonl"
+      assert manifest["artifacts"]["codex_session"]["status"] == "not_applicable"
+      assert manifest["artifacts"]["validation"]["status"] == "not_applicable"
+      assert manifest["artifacts"]["pr"]["status"] == "not_applicable"
+      refute Map.has_key?(manifest["artifact_paths"], "codex_session")
+      refute Map.has_key?(manifest["artifact_paths"], "validation")
+      refute Map.has_key?(manifest["artifact_paths"], "pr")
 
       assert {:ok, _context} =
                Evidence.append_event(context, "session_started", %{
@@ -51,6 +57,10 @@ defmodule SymphonyElixir.EvidenceTest do
       assert event["session_id"] == nil
       assert event["pr_url"] == nil
       assert event["trust_level"] == "machine_captured"
+
+      manifest = read_json!(Path.join(session_dir, "manifest.json"))
+      assert manifest["artifact_paths"]["events"] == "events.jsonl"
+      assert manifest["artifacts"]["events"]["status"] == "captured"
     after
       File.rm_rf(test_root)
     end
@@ -110,7 +120,7 @@ defmodule SymphonyElixir.EvidenceTest do
     end
   end
 
-  test "cleanup preflight writes git summary and preserves local prloop artifacts" do
+  test "cleanup preflight writes git summary and preserves DOC-18 shaped prloop artifacts" do
     test_root = tmp_dir("evidence-cleanup-preflight")
     logs_root = Path.join(test_root, "logs")
     workspace = Path.join(test_root, "workspace")
@@ -121,9 +131,16 @@ defmodule SymphonyElixir.EvidenceTest do
       File.write!(Path.join(workspace, "uncommitted.txt"), "local work\n")
 
       prloop_root = Path.join([workspace, ".git", "cloud-review-loop"])
-      File.mkdir_p!(Path.join(prloop_root, "tmux"))
-      File.write!(Path.join(prloop_root, "state.json"), ~s({"state":"succeeded"}))
-      File.write!(Path.join([prloop_root, "tmux", "prloop.log"]), "review loop log\n")
+      state_path = Path.join([prloop_root, "state", "run-123", "state.json"])
+      log_dir = Path.join(prloop_root, "tmux")
+      File.mkdir_p!(Path.dirname(state_path))
+      File.mkdir_p!(log_dir)
+      File.write!(state_path, ~s({"state":"succeeded","runId":"run-123"}))
+
+      File.write!(
+        Path.join(log_dir, "prloop-doc-doc-18-pr-27.log"),
+        Jason.encode!(%{"statePath" => state_path, "logDir" => log_dir}) <> "\nreview loop log\n"
+      )
 
       context = %{
         issue_id: "issue-52",
@@ -145,7 +162,29 @@ defmodule SymphonyElixir.EvidenceTest do
       assert git["status_summary"]["file_count"] == 1
 
       assert File.read!(Path.join([session_dir, "prloop", "state.json"])) =~ "succeeded"
-      assert File.read!(Path.join([session_dir, "prloop", "logs", "prloop.log"])) =~ "review loop log"
+
+      assert File.read!(Path.join([session_dir, "prloop", "logs", "prloop-doc-doc-18-pr-27.log"])) =~
+               "statePath"
+
+      manifest = read_json!(Path.join(session_dir, "manifest.json"))
+      assert manifest["artifact_paths"]["events"] == "events.jsonl"
+      assert manifest["artifact_paths"]["git"] == "git.json"
+      assert manifest["artifact_paths"]["prloop_state"] == "prloop/state.json"
+      assert manifest["artifact_paths"]["prloop_log_dir"] == "prloop/logs"
+      refute Map.has_key?(manifest["artifact_paths"], "codex_session")
+      refute Map.has_key?(manifest["artifact_paths"], "validation")
+      refute Map.has_key?(manifest["artifact_paths"], "pr")
+      refute Map.has_key?(manifest["artifact_paths"], "ci")
+      refute Map.has_key?(manifest["artifact_paths"], "linear")
+
+      assert manifest["artifacts"]["prloop_state"]["status"] == "captured"
+      assert manifest["artifacts"]["prloop_state"]["path"] == "prloop/state.json"
+      assert manifest["artifacts"]["prloop_state"]["source_path"] == state_path
+      assert manifest["artifacts"]["prloop_state"]["discovery"] == "log_state_path"
+      assert manifest["artifacts"]["prloop_log_dir"]["status"] == "captured"
+      assert manifest["artifacts"]["prloop_log_dir"]["path"] == "prloop/logs"
+      assert manifest["artifacts"]["prloop_log_dir"]["source_path"] == log_dir
+      assert manifest["artifacts"]["codex_session"]["status"] == "not_applicable"
 
       categories =
         session_dir
@@ -155,6 +194,42 @@ defmodule SymphonyElixir.EvidenceTest do
 
       assert "workspace_cleanup_preflight" in categories
       assert "workspace_cleanup_completed" in categories
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "cleanup preflight falls back to newest nested prloop state when logs lack statePath" do
+    test_root = tmp_dir("evidence-cleanup-prloop-nested")
+    logs_root = Path.join(test_root, "logs")
+    workspace = Path.join(test_root, "workspace")
+    Application.put_env(:symphony_elixir, :logs_root, logs_root)
+
+    try do
+      create_git_workspace!(workspace)
+
+      prloop_root = Path.join([workspace, ".git", "cloud-review-loop"])
+      state_path = Path.join([prloop_root, "state", "run-456", "state.json"])
+      File.mkdir_p!(Path.dirname(state_path))
+      File.mkdir_p!(Path.join(prloop_root, "tmux"))
+      File.write!(state_path, ~s({"state":"waiting","runId":"run-456"}))
+      File.write!(Path.join([prloop_root, "tmux", "prloop.log"]), "review loop log without state path\n")
+
+      context = %{
+        issue_identifier: "DOC-54",
+        run_id: "cleanup-nested-run",
+        workspace_path: workspace
+      }
+
+      assert {:ok, _evidence_context} = Evidence.capture_workspace_cleanup_preflight(context, workspace)
+
+      session_dir = Path.join([logs_root, "evidence", "sessions", "DOC-54", "cleanup-nested-run"])
+      assert File.read!(Path.join([session_dir, "prloop", "state.json"])) =~ "waiting"
+
+      manifest = read_json!(Path.join(session_dir, "manifest.json"))
+      assert manifest["artifact_paths"]["prloop_state"] == "prloop/state.json"
+      assert manifest["artifacts"]["prloop_state"]["source_path"] == state_path
+      assert manifest["artifacts"]["prloop_state"]["discovery"] == "nested_state_search"
     after
       File.rm_rf(test_root)
     end
