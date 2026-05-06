@@ -812,10 +812,16 @@ Part B: Tracker state refresh
 When the service starts:
 
 1. Query tracker for issues in terminal states.
-2. For each returned issue identifier, remove the corresponding workspace directory.
+2. For each returned issue identifier, run workspace cleanup evidence preflight, then remove the
+   corresponding workspace directory only when the preflight allows deletion.
 3. If the terminal-issues fetch fails, log a warning and continue startup.
 
 This prevents stale terminal workspaces from accumulating after restarts.
+
+The Docly implementation writes cleanup evidence under `$SYMPHONY_LOGS_ROOT/evidence/` before
+deletion. If evidence harvest fails and deletion could lose uncommitted work, unpushed work, or
+local `prloop` artifacts, the workspace is preserved and the issue is routed to the configured
+blocked state, which defaults to `Human Review`.
 
 ## 9. Workspace Management and Safety
 
@@ -892,6 +898,8 @@ Failure semantics:
 - `before_run` failure or timeout is fatal to the current run attempt.
 - `after_run` failure or timeout is logged and ignored.
 - `before_remove` failure or timeout is logged and ignored.
+- Workspace cleanup evidence preflight runs before `before_remove`; a risky evidence harvest failure
+  blocks deletion instead of being treated as a hook failure.
 
 ### 9.5 Safety Invariants
 

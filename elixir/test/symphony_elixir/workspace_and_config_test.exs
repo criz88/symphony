@@ -279,6 +279,60 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "workspace cleanup writes evidence before deleting local workspace" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-evidence-cleanup-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      logs_root = Path.join(test_root, "logs")
+      target_workspace = Path.join(workspace_root, "DOC-200")
+
+      Application.put_env(:symphony_elixir, :logs_root, logs_root)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+      create_git_workspace!(target_workspace)
+
+      prloop_root = Path.join([target_workspace, ".git", "cloud-review-loop"])
+      File.mkdir_p!(Path.join(prloop_root, "tmux"))
+      File.write!(Path.join(prloop_root, "state.json"), ~s({"state":"succeeded"}))
+      File.write!(Path.join([prloop_root, "tmux", "loop.log"]), "clean review\n")
+
+      issue = %Issue{id: "issue-200", identifier: "DOC-200", title: "Evidence cleanup"}
+
+      assert :ok = Workspace.remove_issue_workspaces(issue)
+      refute File.exists?(target_workspace)
+
+      session_root = Path.join([logs_root, "evidence", "sessions", "DOC-200"])
+      [run_id] = File.ls!(session_root)
+      session_dir = Path.join(session_root, run_id)
+
+      manifest = read_json!(Path.join(session_dir, "manifest.json"))
+      assert manifest["issue_id"] == "issue-200"
+      assert manifest["outcome"] == "completed"
+
+      git = read_json!(Path.join(session_dir, "git.json"))
+      assert git["branch"] == "main"
+      assert git["uncommitted_work"] == false
+
+      assert File.read!(Path.join([session_dir, "prloop", "state.json"])) =~ "succeeded"
+      assert File.read!(Path.join([session_dir, "prloop", "logs", "loop.log"])) =~ "clean review"
+
+      categories =
+        session_dir
+        |> Path.join("events.jsonl")
+        |> read_jsonl!()
+        |> Enum.map(& &1["category"])
+
+      assert "workspace_cleanup_preflight" in categories
+      assert "workspace_cleanup_completed" in categories
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "workspace cleanup handles missing workspace root" do
     missing_root =
       Path.join(
@@ -1334,5 +1388,35 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  defp create_git_workspace!(workspace) do
+    File.mkdir_p!(workspace)
+    run!("git", ["-C", workspace, "init", "-b", "main"])
+    run!("git", ["-C", workspace, "config", "user.name", "Test User"])
+    run!("git", ["-C", workspace, "config", "user.email", "test@example.com"])
+    File.write!(Path.join(workspace, "README.md"), "hello\n")
+    run!("git", ["-C", workspace, "add", "README.md"])
+    run!("git", ["-C", workspace, "commit", "-m", "initial"])
+  end
+
+  defp run!(command, args) do
+    case System.cmd(command, args, stderr_to_stdout: true) do
+      {_output, 0} -> :ok
+      {output, status} -> flunk("#{command} #{Enum.join(args, " ")} failed #{status}: #{output}")
+    end
+  end
+
+  defp read_json!(path) do
+    path
+    |> File.read!()
+    |> Jason.decode!()
+  end
+
+  defp read_jsonl!(path) do
+    path
+    |> File.read!()
+    |> String.split("\n", trim: true)
+    |> Enum.map(&Jason.decode!/1)
   end
 end

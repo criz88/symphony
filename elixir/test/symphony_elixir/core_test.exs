@@ -350,6 +350,90 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "terminal cleanup preserves risky workspace and routes issue when evidence harvest fails" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-terminal-evidence-failure-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-evidence-failure"
+    issue_identifier = "DOC-260"
+    workspace = Path.join(test_root, issue_identifier)
+    logs_root = Path.join(test_root, "logs")
+
+    try do
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+      Application.put_env(:symphony_elixir, :logs_root, logs_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: test_root,
+        tracker_active_states: ["Todo", "In Progress", "In Review"],
+        tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"],
+        review_monitor_blocked_state: "Human Review"
+      )
+
+      create_git_workspace!(workspace)
+      File.write!(Path.join(workspace, "uncommitted.txt"), "local work\n")
+
+      prloop_root = Path.join([workspace, ".git", "cloud-review-loop"])
+      File.mkdir_p!(Path.join(prloop_root, "state.json"))
+
+      agent_pid =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      state = %Orchestrator.State{
+        running: %{
+          issue_id => %{
+            pid: agent_pid,
+            ref: nil,
+            identifier: issue_identifier,
+            issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
+            started_at: DateTime.utc_now()
+          }
+        },
+        claimed: MapSet.new([issue_id]),
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        retry_attempts: %{}
+      }
+
+      issue = %Issue{
+        id: issue_id,
+        identifier: issue_identifier,
+        state: "Closed",
+        title: "Done with risky local evidence",
+        description: "Cleanup should preserve workspace",
+        labels: []
+      }
+
+      updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+      refute Map.has_key?(updated_state.running, issue_id)
+      refute MapSet.member?(updated_state.claimed, issue_id)
+      refute Process.alive?(agent_pid)
+      assert File.exists?(workspace)
+
+      assert_receive {:memory_tracker_comment, ^issue_id, body}
+      assert body =~ "evidence harvest failed"
+      assert body =~ "prloop_evidence_under_workspace"
+      assert_receive {:memory_tracker_state_update, ^issue_id, "Human Review"}
+
+      session_root = Path.join([logs_root, "evidence", "sessions", issue_identifier])
+      [run_id] = File.ls!(session_root)
+      events = read_jsonl!(Path.join([session_root, run_id, "events.jsonl"]))
+
+      assert Enum.any?(events, &(&1["category"] == "evidence_capture_failed"))
+      refute Enum.any?(events, &(&1["category"] == "workspace_cleanup_completed"))
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "missing running issues stop active agents without cleaning the workspace" do
     test_root =
       Path.join(
@@ -978,6 +1062,30 @@ defmodule SymphonyElixir.CoreTest do
       retry_entry ->
         {retry_entry, state}
     end
+  end
+
+  defp create_git_workspace!(workspace) do
+    File.mkdir_p!(workspace)
+    run!("git", ["-C", workspace, "init", "-b", "main"])
+    run!("git", ["-C", workspace, "config", "user.name", "Test User"])
+    run!("git", ["-C", workspace, "config", "user.email", "test@example.com"])
+    File.write!(Path.join(workspace, "README.md"), "hello\n")
+    run!("git", ["-C", workspace, "add", "README.md"])
+    run!("git", ["-C", workspace, "commit", "-m", "initial"])
+  end
+
+  defp run!(command, args) do
+    case System.cmd(command, args, stderr_to_stdout: true) do
+      {_output, 0} -> :ok
+      {output, status} -> flunk("#{command} #{Enum.join(args, " ")} failed #{status}: #{output}")
+    end
+  end
+
+  defp read_jsonl!(path) do
+    path
+    |> File.read!()
+    |> String.split("\n", trim: true)
+    |> Enum.map(&Jason.decode!/1)
   end
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)

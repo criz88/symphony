@@ -394,7 +394,7 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, true)
+        terminate_running_issue(state, issue.id, true, issue)
 
       !issue_routable_to_worker?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
@@ -522,7 +522,7 @@ defmodule SymphonyElixir.Orchestrator do
     %{state | running: Map.put(state.running, issue_id, running_entry)}
   end
 
-  defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace) do
+  defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace, cleanup_issue \\ nil) do
     case Map.get(state.running, issue_id) do
       nil ->
         release_issue_claim(state, issue_id)
@@ -532,7 +532,8 @@ defmodule SymphonyElixir.Orchestrator do
         worker_host = Map.get(running_entry, :worker_host)
 
         if cleanup_workspace do
-          cleanup_issue_workspace(identifier, worker_host)
+          cleanup_issue = cleanup_issue || Map.get(running_entry, :issue) || identifier
+          cleanup_issue_workspace(cleanup_issue, worker_host)
         end
 
         if is_pid(pid) do
@@ -1012,7 +1013,7 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
-        cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
+        cleanup_issue_workspace(issue, metadata[:worker_host])
         {:noreply, release_issue_claim(state, issue_id)}
 
       retry_candidate_issue?(issue, terminal_states) ->
@@ -1030,21 +1031,103 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, release_issue_claim(state, issue_id)}
   end
 
-  defp cleanup_issue_workspace(identifier, worker_host \\ nil)
+  defp cleanup_issue_workspace(issue_or_identifier, worker_host \\ nil)
+
+  defp cleanup_issue_workspace(%Issue{} = issue, worker_host) do
+    case Workspace.remove_issue_workspaces(issue, worker_host) do
+      :ok ->
+        :ok
+
+      {:error, {:evidence_capture_failed, _reason, _risks} = reason} ->
+        route_cleanup_evidence_failure(issue, reason)
+
+      {:error, reason} ->
+        Logger.warning("Workspace cleanup failed for #{issue_context(issue)} error=#{inspect(reason)}")
+        :ok
+    end
+  end
 
   defp cleanup_issue_workspace(identifier, worker_host) when is_binary(identifier) do
-    Workspace.remove_issue_workspaces(identifier, worker_host)
+    case Workspace.remove_issue_workspaces(identifier, worker_host) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Workspace cleanup failed for issue_identifier=#{identifier} error=#{inspect(reason)}")
+        :ok
+    end
   end
 
   defp cleanup_issue_workspace(_identifier, _worker_host), do: :ok
+
+  defp route_cleanup_evidence_failure(%Issue{id: issue_id} = issue, reason)
+       when is_binary(issue_id) do
+    blocked_state = cleanup_blocked_state()
+    comment = cleanup_evidence_failure_comment(reason)
+
+    with :ok <- Tracker.create_comment(issue_id, comment),
+         :ok <- Tracker.update_issue_state(issue_id, blocked_state) do
+      Logger.warning("Workspace cleanup evidence failed for #{issue_context(issue)}; moved issue to #{blocked_state}")
+      :ok
+    else
+      {:error, error} ->
+        Logger.warning("Workspace cleanup evidence failed for #{issue_context(issue)} but tracker routing failed error=#{inspect(error)}")
+        :ok
+    end
+  end
+
+  defp route_cleanup_evidence_failure(%Issue{} = issue, reason) do
+    Logger.warning("Workspace cleanup evidence failed for #{issue_context(issue)} without issue id error=#{inspect(reason)}")
+    :ok
+  end
+
+  defp cleanup_blocked_state do
+    case Config.settings!().review_monitor.blocked_state do
+      state when is_binary(state) ->
+        case String.trim(state) do
+          "" -> "Human Review"
+          trimmed -> trimmed
+        end
+
+      _ ->
+        "Human Review"
+    end
+  end
+
+  defp cleanup_evidence_failure_comment({:evidence_capture_failed, reason, risks}) do
+    """
+    ## Symphony Workspace Cleanup
+
+    Moved this issue to Human Review.
+
+    Reason: evidence harvest failed before workspace cleanup and deleting the workspace could lose local state.
+
+    Evidence:
+    - capture_error: `#{inspect(reason)}`
+    - cleanup_risks: `#{inspect(risks)}`
+    """
+  end
+
+  defp cleanup_evidence_failure_comment(reason) do
+    """
+    ## Symphony Workspace Cleanup
+
+    Moved this issue to Human Review.
+
+    Reason: evidence harvest failed before workspace cleanup and deleting the workspace could lose local state.
+
+    Evidence:
+    - capture_error: `#{inspect(reason)}`
+    """
+  end
 
   defp run_terminal_workspace_cleanup do
     case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
       {:ok, issues} ->
         issues
         |> Enum.each(fn
-          %Issue{identifier: identifier} when is_binary(identifier) ->
-            cleanup_issue_workspace(identifier)
+          %Issue{identifier: identifier} = issue when is_binary(identifier) ->
+            cleanup_issue_workspace(issue)
 
           _ ->
             :ok
