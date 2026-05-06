@@ -18,7 +18,13 @@ defmodule SymphonyElixir.Evidence do
     :session_id,
     :thread_id,
     :turn_id,
+    :thread_parse_status,
+    :turn_parse_status,
+    :codex_session_source_path,
+    :codex_session_path_parse_status,
+    :codex_session_copy_status,
     :workspace_path,
+    :worker_host,
     :branch,
     :commit,
     :pr_url,
@@ -194,6 +200,148 @@ defmodule SymphonyElixir.Evidence do
     end
   end
 
+  @spec capture_session_started(map(), map(), keyword()) ::
+          {:ok, evidence_context()} | {:error, term()}
+  def capture_session_started(context, attrs, opts \\ []) when is_map(context) and is_map(attrs) do
+    context =
+      context
+      |> merge_context_attrs(attrs)
+      |> Map.put(:source, "codex_app_server")
+      |> normalize_context()
+
+    with {:ok, context} <- ensure_session(context, opts),
+         :ok <- maybe_write_workspace_git_summary(context, opts),
+         {:ok, context} <- maybe_write_linear_summary(context, attrs, opts),
+         {:ok, context} <- capture_codex_session_artifact(context, attrs, opts),
+         {:ok, context} <-
+           append_event(
+             context,
+             "session_started",
+             %{
+               evidence_ref: "manifest.json",
+               summary: "Codex session started",
+               trust_level: "machine_captured",
+               codex_session_copy_status: value(context, :codex_session_copy_status),
+               codex_session_source_path: value(context, :codex_session_source_path),
+               thread_parse_status: value(context, :thread_parse_status),
+               turn_parse_status: value(context, :turn_parse_status)
+             },
+             opts
+           ) do
+      update_manifest(
+        context,
+        %{
+          outcome: "running",
+          last_error: nil,
+          session_id: context.session_id,
+          thread_id: context.thread_id,
+          turn_id: context.turn_id,
+          thread_parse_status: context.thread_parse_status,
+          turn_parse_status: context.turn_parse_status,
+          codex_session_source_path: context.codex_session_source_path,
+          codex_session_path_parse_status: context.codex_session_path_parse_status,
+          codex_session_copy_status: context.codex_session_copy_status
+        },
+        opts
+      )
+    end
+  end
+
+  @spec capture_session_completed(map(), map(), keyword()) ::
+          {:ok, evidence_context()} | {:error, term()}
+  def capture_session_completed(context, attrs, opts \\ []) when is_map(context) and is_map(attrs) do
+    context =
+      context
+      |> merge_context_attrs(attrs)
+      |> normalize_context()
+
+    with {:ok, context} <-
+           append_event(
+             context,
+             "session_completed",
+             %{
+               evidence_ref: "manifest.json",
+               summary: "Codex session completed",
+               trust_level: "machine_captured"
+             },
+             opts
+           ) do
+      update_manifest(
+        context,
+        %{
+          ended_at: now_iso8601(),
+          outcome: "completed",
+          last_error: nil,
+          session_id: context.session_id,
+          thread_id: context.thread_id,
+          turn_id: context.turn_id
+        },
+        opts
+      )
+    end
+  end
+
+  @spec capture_session_failed(map(), map(), keyword()) ::
+          {:ok, evidence_context()} | {:error, term()}
+  def capture_session_failed(context, attrs, opts \\ []) when is_map(context) and is_map(attrs) do
+    context =
+      context
+      |> merge_context_attrs(attrs)
+      |> normalize_context()
+
+    last_error = value(attrs, :last_error) || value(attrs, :reason)
+
+    with {:ok, context} <-
+           append_event(
+             context,
+             "session_failed",
+             %{
+               evidence_ref: "manifest.json",
+               summary: "Codex session failed",
+               trust_level: "machine_captured",
+               last_error: inspect(last_error)
+             },
+             opts
+           ) do
+      update_manifest(
+        context,
+        %{
+          ended_at: now_iso8601(),
+          outcome: "failed",
+          last_error: inspect(last_error),
+          session_id: context.session_id,
+          thread_id: context.thread_id,
+          turn_id: context.turn_id
+        },
+        opts
+      )
+    end
+  end
+
+  @spec write_linear_summary(map(), map(), keyword()) :: {:ok, evidence_context()} | {:error, term()}
+  def write_linear_summary(context, issue, opts \\ []) when is_map(context) and is_map(issue) do
+    with {:ok, context} <- ensure_session(context, opts) do
+      payload =
+        context
+        |> join_payload("linear")
+        |> Map.merge(%{
+          "issue" => linear_issue_summary(issue),
+          "trust_level" => "machine_captured"
+        })
+
+      with :ok <- write_json_file(Path.join(context.session_dir, "linear.json"), payload) do
+        update_manifest(
+          context,
+          %{
+            artifact_paths: %{linear: "linear.json"},
+            artifacts: %{linear: artifact_status("captured", "linear", nil, "linear.json")}
+          },
+          opts
+        )
+      end
+    end
+  end
+
   @spec git_summary(Path.t()) :: {:ok, map()} | {:error, term()}
   def git_summary(workspace) when is_binary(workspace) do
     with {:ok, _git_dir} <- run_git(workspace, ["rev-parse", "--git-dir"]) do
@@ -232,7 +380,7 @@ defmodule SymphonyElixir.Evidence do
       |> Map.put(:workspace_path, workspace)
       |> normalize_context()
 
-    case init_manifest(context, opts) do
+    case ensure_session(context, opts) do
       {:ok, context} ->
         do_capture_workspace_cleanup_preflight(context, workspace, opts)
 
@@ -381,6 +529,154 @@ defmodule SymphonyElixir.Evidence do
   end
 
   defp maybe_write_git_summary(_context, {:error, _reason}, _opts), do: :ok
+
+  defp maybe_write_workspace_git_summary(%{workspace_path: workspace} = context, opts)
+       when is_binary(workspace) do
+    maybe_write_git_summary(context, git_summary(workspace), opts)
+  end
+
+  defp maybe_write_workspace_git_summary(_context, _opts), do: :ok
+
+  defp maybe_write_linear_summary(context, attrs, opts) do
+    case value(attrs, :linear) || value(attrs, :issue) || value(context, :linear) do
+      issue when is_map(issue) ->
+        case write_linear_summary(context, issue, opts) do
+          {:ok, _context} -> {:ok, context}
+          {:error, reason} -> {:error, reason}
+        end
+
+      _ ->
+        {:ok, context}
+    end
+  end
+
+  defp capture_codex_session_artifact(context, attrs, opts) do
+    source_path =
+      value(attrs, :codex_session_source_path) ||
+        value(context, :codex_session_source_path)
+
+    context =
+      context
+      |> maybe_put_context(:codex_session_source_path, source_path)
+      |> normalize_context()
+
+    artifact = codex_session_artifact(context, source_path)
+    attrs = codex_session_manifest_attrs(context, artifact)
+
+    with {:ok, context} <- update_manifest(context, attrs, opts) do
+      {:ok,
+       context
+       |> maybe_put_context(:codex_session_source_path, Map.get(artifact, :source_path))
+       |> maybe_put_context(:codex_session_copy_status, artifact |> Map.get(:details, %{}) |> Map.get(:copy_status))
+       |> normalize_context()}
+    end
+  end
+
+  defp codex_session_artifact(_context, source_path)
+       when not is_binary(source_path) or source_path == "" do
+    %{
+      status: "missing",
+      path: nil,
+      source: "codex",
+      source_path: source_path,
+      reason: "source_path_unavailable",
+      details: %{
+        copy_status: "not_attempted",
+        risk: "codex_rollout_path_was_not_available_from_thread_payload"
+      }
+    }
+  end
+
+  defp codex_session_artifact(%{worker_host: worker_host}, source_path) when is_binary(worker_host) do
+    %{
+      status: "indexed",
+      path: nil,
+      source: "codex",
+      source_path: source_path,
+      reason: "remote_worker_source_not_copied",
+      details: %{
+        copy_status: "not_attempted",
+        risk: "source_path_is_on_remote_worker_and_may_be_removed_before_later_harvest"
+      }
+    }
+  end
+
+  defp codex_session_artifact(context, source_path) when is_binary(source_path) do
+    expanded_source = Path.expand(source_path)
+    target = Path.join(context.session_dir, "codex-session.jsonl")
+
+    cond do
+      File.regular?(expanded_source) ->
+        case File.cp(expanded_source, target) do
+          :ok ->
+            %{
+              status: "captured",
+              path: "codex-session.jsonl",
+              source: "codex",
+              source_path: expanded_source,
+              reason: nil,
+              details: %{copy_status: "copied", risk: nil}
+            }
+
+          {:error, reason} ->
+            %{
+              status: "indexed",
+              path: nil,
+              source: "codex",
+              source_path: expanded_source,
+              reason: "copy_failed",
+              details: %{
+                copy_status: "failed",
+                error: inspect(reason),
+                risk: "source_may_be_removed_before_later_harvest"
+              }
+            }
+        end
+
+      File.exists?(expanded_source) ->
+        %{
+          status: "indexed",
+          path: nil,
+          source: "codex",
+          source_path: expanded_source,
+          reason: "source_not_regular_file",
+          details: %{
+            copy_status: "not_attempted",
+            risk: "source_path_was_not_a_regular_jsonl_file"
+          }
+        }
+
+      true ->
+        %{
+          status: "indexed",
+          path: nil,
+          source: "codex",
+          source_path: expanded_source,
+          reason: "source_not_found",
+          details: %{
+            copy_status: "not_attempted",
+            risk: "source_may_be_removed_before_later_harvest"
+          }
+        }
+    end
+  end
+
+  defp codex_session_manifest_attrs(context, artifact) do
+    copy_status = artifact |> Map.get(:details, %{}) |> Map.get(:copy_status)
+
+    %{
+      codex_session_source_path: Map.get(artifact, :source_path) || context.codex_session_source_path,
+      codex_session_copy_status: copy_status,
+      artifacts: %{codex_session: artifact_status(artifact)}
+    }
+    |> maybe_put_artifact_paths(:codex_session, artifact)
+  end
+
+  defp maybe_put_artifact_paths(attrs, key, %{status: "captured", path: path}) when is_binary(path) do
+    Map.put(attrs, :artifact_paths, %{key => path})
+  end
+
+  defp maybe_put_artifact_paths(attrs, _key, _artifact), do: attrs
 
   defp harvest_prloop(context, workspace, opts) do
     prloop_root = Path.join([workspace, ".git", "cloud-review-loop"])
@@ -751,7 +1047,13 @@ defmodule SymphonyElixir.Evidence do
       session_id: context.session_id,
       thread_id: context.thread_id,
       turn_id: context.turn_id,
+      thread_parse_status: context.thread_parse_status,
+      turn_parse_status: context.turn_parse_status,
+      codex_session_source_path: context.codex_session_source_path,
+      codex_session_path_parse_status: context.codex_session_path_parse_status,
+      codex_session_copy_status: context.codex_session_copy_status,
       workspace_path: context.workspace_path,
+      worker_host: context.worker_host,
       branch: context.branch,
       commit: context.commit,
       pr_url: context.pr_url,
@@ -809,7 +1111,13 @@ defmodule SymphonyElixir.Evidence do
       session_id: value(context, :session_id),
       thread_id: value(context, :thread_id),
       turn_id: value(context, :turn_id),
+      thread_parse_status: value(context, :thread_parse_status),
+      turn_parse_status: value(context, :turn_parse_status),
+      codex_session_source_path: value(context, :codex_session_source_path),
+      codex_session_path_parse_status: value(context, :codex_session_path_parse_status),
+      codex_session_copy_status: value(context, :codex_session_copy_status),
       workspace_path: value(context, :workspace_path),
+      worker_host: value(context, :worker_host),
       branch: value(context, :branch),
       commit: value(context, :commit),
       pr_url: value(context, :pr_url),
@@ -844,9 +1152,9 @@ defmodule SymphonyElixir.Evidence do
   end
 
   defp read_json_file(path) do
-    with {:ok, content} <- File.read(path),
-         {:ok, decoded} <- Jason.decode(content) do
-      {:ok, decoded}
+    case File.read(path) do
+      {:ok, content} -> Jason.decode(content)
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -936,6 +1244,59 @@ defmodule SymphonyElixir.Evidence do
 
   defp stringify_keys(values) when is_list(values), do: Enum.map(values, &stringify_keys/1)
   defp stringify_keys(value), do: value
+
+  defp linear_issue_summary(issue) when is_map(issue) do
+    %{
+      id: value(issue, :id),
+      identifier: value(issue, :identifier),
+      title: value(issue, :title),
+      description: value(issue, :description),
+      priority: value(issue, :priority),
+      state: value(issue, :state),
+      branch_name: value(issue, :branch_name),
+      url: value(issue, :url),
+      assignee_id: value(issue, :assignee_id),
+      labels: value(issue, :labels) || [],
+      blocked_by: value(issue, :blocked_by) || [],
+      assigned_to_worker: value(issue, :assigned_to_worker),
+      created_at: json_timestamp(value(issue, :created_at)),
+      updated_at: json_timestamp(value(issue, :updated_at))
+    }
+  end
+
+  defp json_timestamp(%DateTime{} = timestamp), do: DateTime.to_iso8601(timestamp)
+  defp json_timestamp(value), do: value
+
+  defp merge_context_attrs(context, attrs) do
+    Enum.reduce(
+      [
+        :issue_id,
+        :issue_identifier,
+        :run_id,
+        :session_id,
+        :thread_id,
+        :turn_id,
+        :thread_parse_status,
+        :turn_parse_status,
+        :codex_session_source_path,
+        :codex_session_path_parse_status,
+        :codex_session_copy_status,
+        :workspace_path,
+        :worker_host,
+        :branch,
+        :commit,
+        :pr_url,
+        :pr_number,
+        :workpad_comment_id,
+        :prloop_state_path,
+        :prloop_log_dir
+      ],
+      context,
+      fn key, acc ->
+        maybe_put_context(acc, key, value(attrs, key))
+      end
+    )
+  end
 
   defp value(map, key) when is_map(map) and is_atom(key) do
     case Map.fetch(map, key) do

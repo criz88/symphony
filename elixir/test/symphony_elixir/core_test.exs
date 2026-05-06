@@ -350,6 +350,120 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "terminal cleanup reuses captured session evidence context" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-terminal-session-evidence-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-session-evidence"
+    issue_identifier = "DOC-55"
+    workspace = Path.join(test_root, issue_identifier)
+    logs_root = Path.join(test_root, "logs")
+    rollout_path = Path.join(test_root, "rollout-doc-55.jsonl")
+
+    try do
+      Application.put_env(:symphony_elixir, :logs_root, logs_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: test_root,
+        tracker_active_states: ["Todo", "In Progress", "In Review"],
+        tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"]
+      )
+
+      create_git_workspace!(workspace)
+      File.write!(rollout_path, ~s({"type":"session","id":"thread-doc-55"}\n))
+
+      running_issue = %Issue{
+        id: issue_id,
+        identifier: issue_identifier,
+        state: "In Progress",
+        title: "Capture lifecycle evidence",
+        labels: ["area-symphony"]
+      }
+
+      assert {:ok, evidence_context} =
+               SymphonyElixir.Evidence.capture_session_started(
+                 %{
+                   issue_id: issue_id,
+                   issue_identifier: issue_identifier,
+                   run_id: "captured-session",
+                   session_id: "thread-doc-55-turn-1",
+                   thread_id: "thread-doc-55",
+                   turn_id: "turn-1",
+                   thread_parse_status: "parsed",
+                   turn_parse_status: "parsed",
+                   codex_session_source_path: rollout_path,
+                   workspace_path: workspace
+                 },
+                 %{linear: running_issue}
+               )
+
+      agent_pid =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      state = %Orchestrator.State{
+        running: %{
+          issue_id => %{
+            pid: agent_pid,
+            ref: nil,
+            identifier: issue_identifier,
+            issue: running_issue,
+            workspace_path: workspace,
+            session_id: "thread-doc-55-turn-1",
+            thread_id: "thread-doc-55",
+            turn_id: "turn-1",
+            evidence_context: evidence_context,
+            started_at: DateTime.utc_now()
+          }
+        },
+        claimed: MapSet.new([issue_id]),
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        retry_attempts: %{}
+      }
+
+      terminal_issue = %Issue{
+        id: issue_id,
+        identifier: issue_identifier,
+        state: "Closed",
+        title: "Capture lifecycle evidence",
+        labels: ["area-symphony"]
+      }
+
+      updated_state = Orchestrator.reconcile_issue_states_for_test([terminal_issue], state)
+
+      refute Map.has_key?(updated_state.running, issue_id)
+      refute MapSet.member?(updated_state.claimed, issue_id)
+      refute Process.alive?(agent_pid)
+      refute File.exists?(workspace)
+
+      session_dir = Path.join([logs_root, "evidence", "sessions", issue_identifier, "captured-session"])
+      manifest = read_json!(Path.join(session_dir, "manifest.json"))
+      assert manifest["session_id"] == "thread-doc-55-turn-1"
+      assert manifest["thread_id"] == "thread-doc-55"
+      assert manifest["turn_id"] == "turn-1"
+      assert manifest["outcome"] == "completed"
+
+      categories =
+        session_dir
+        |> Path.join("events.jsonl")
+        |> read_jsonl!()
+        |> Enum.map(& &1["category"])
+
+      assert "session_started" in categories
+      assert "linear_state_changed" in categories
+      assert "workspace_cleanup_preflight" in categories
+      assert "workspace_cleanup_completed" in categories
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "terminal cleanup preserves risky workspace and routes issue when evidence harvest fails" do
     test_root =
       Path.join(
@@ -378,7 +492,8 @@ defmodule SymphonyElixir.CoreTest do
       File.write!(Path.join(workspace, "uncommitted.txt"), "local work\n")
 
       prloop_root = Path.join([workspace, ".git", "cloud-review-loop"])
-      File.mkdir_p!(Path.join(prloop_root, "state.json"))
+      File.mkdir_p!(prloop_root)
+      File.write!(Path.join(prloop_root, "tmux"), "not a directory\n")
 
       agent_pid =
         spawn(fn ->
@@ -1079,6 +1194,12 @@ defmodule SymphonyElixir.CoreTest do
       {_output, 0} -> :ok
       {output, status} -> flunk("#{command} #{Enum.join(args, " ")} failed #{status}: #{output}")
     end
+  end
+
+  defp read_json!(path) do
+    path
+    |> File.read!()
+    |> Jason.decode!()
   end
 
   defp read_jsonl!(path) do

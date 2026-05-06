@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, ReviewMonitor, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, Evidence, ReviewMonitor, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -132,6 +132,7 @@ defmodule SymphonyElixir.Orchestrator do
         {running_entry, state} = pop_running_entry(state, issue_id)
         state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
+        maybe_record_abnormal_worker_exit(running_entry, reason)
 
         state =
           case reason do
@@ -185,6 +186,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       running_entry ->
         {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
+        updated_running_entry = record_codex_evidence_update(updated_running_entry, update)
 
         state =
           state
@@ -390,6 +392,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_issue_state(%Issue{} = issue, state, active_states, terminal_states) do
+    state = record_linear_state_change(state, issue)
+
     cond do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
@@ -471,6 +475,59 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp record_linear_state_change(%State{} = state, %Issue{id: issue_id} = issue)
+       when is_binary(issue_id) do
+    case Map.get(state.running, issue_id) do
+      %{issue: %Issue{state: previous_state}, evidence_context: evidence_context} = running_entry
+      when is_map(evidence_context) ->
+        maybe_record_linear_state_change(state, issue, running_entry, previous_state, evidence_context)
+
+      _ ->
+        state
+    end
+  end
+
+  defp record_linear_state_change(%State{} = state, _issue), do: state
+
+  defp maybe_record_linear_state_change(state, issue, running_entry, previous_state, evidence_context) do
+    if same_issue_state?(previous_state, issue.state) do
+      state
+    else
+      record_linear_state_evidence(state, issue, running_entry, previous_state, evidence_context)
+    end
+  end
+
+  defp record_linear_state_evidence(state, issue, running_entry, previous_state, evidence_context) do
+    attrs = %{
+      evidence_ref: "linear.json",
+      summary: "Linear state changed from #{previous_state} to #{issue.state}",
+      trust_level: "machine_captured",
+      previous_state: previous_state,
+      new_state: issue.state
+    }
+
+    case write_linear_state_evidence(evidence_context, issue, attrs) do
+      {:ok, evidence_context} ->
+        put_running_entry(state, issue.id, Map.put(running_entry, :evidence_context, evidence_context))
+
+      {:error, reason} ->
+        Logger.warning("Linear state evidence capture failed for #{issue_context(issue)} error=#{inspect(reason)}")
+        state
+    end
+  end
+
+  defp write_linear_state_evidence(evidence_context, issue, attrs) do
+    with {:ok, evidence_context} <- Evidence.write_linear_summary(evidence_context, issue) do
+      Evidence.append_event(evidence_context, "linear_state_changed", attrs)
+    end
+  end
+
+  defp same_issue_state?(left, right) when is_binary(left) and is_binary(right) do
+    normalize_issue_state(left) == normalize_issue_state(right)
+  end
+
+  defp same_issue_state?(left, right), do: left == right
+
   defp normal_agent_in_review_state?(running_entry, %Issue{state: issue_state})
        when is_map(running_entry) and is_binary(issue_state) do
     !review_monitor_worker?(running_entry) and Config.review_monitor_state?(issue_state)
@@ -533,7 +590,7 @@ defmodule SymphonyElixir.Orchestrator do
 
         if cleanup_workspace do
           cleanup_issue = cleanup_issue || Map.get(running_entry, :issue) || identifier
-          cleanup_issue_workspace(cleanup_issue, worker_host)
+          cleanup_issue_workspace(cleanup_issue, worker_host, Map.get(running_entry, :evidence_context))
         end
 
         if is_pid(pid) do
@@ -834,6 +891,10 @@ defmodule SymphonyElixir.Orchestrator do
             worker_host: worker_host,
             workspace_path: nil,
             session_id: nil,
+            thread_id: nil,
+            turn_id: nil,
+            codex_session_source_path: nil,
+            evidence_context: nil,
             last_codex_message: nil,
             last_codex_timestamp: nil,
             last_codex_event: nil,
@@ -1031,10 +1092,10 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, release_issue_claim(state, issue_id)}
   end
 
-  defp cleanup_issue_workspace(issue_or_identifier, worker_host \\ nil)
+  defp cleanup_issue_workspace(issue_or_identifier, worker_host \\ nil, evidence_context \\ nil)
 
-  defp cleanup_issue_workspace(%Issue{} = issue, worker_host) do
-    case Workspace.remove_issue_workspaces(issue, worker_host) do
+  defp cleanup_issue_workspace(%Issue{} = issue, worker_host, evidence_context) do
+    case Workspace.remove_issue_workspaces(issue, worker_host, evidence_context) do
       :ok ->
         :ok
 
@@ -1047,8 +1108,8 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp cleanup_issue_workspace(identifier, worker_host) when is_binary(identifier) do
-    case Workspace.remove_issue_workspaces(identifier, worker_host) do
+  defp cleanup_issue_workspace(identifier, worker_host, evidence_context) when is_binary(identifier) do
+    case Workspace.remove_issue_workspaces(identifier, worker_host, evidence_context) do
       :ok ->
         :ok
 
@@ -1058,7 +1119,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp cleanup_issue_workspace(_identifier, _worker_host), do: :ok
+  defp cleanup_issue_workspace(_identifier, _worker_host, _evidence_context), do: :ok
 
   defp route_cleanup_evidence_failure(%Issue{id: issue_id} = issue, reason)
        when is_binary(issue_id) do
@@ -1428,6 +1489,14 @@ defmodule SymphonyElixir.Orchestrator do
         last_codex_timestamp: timestamp,
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
+        thread_id: codex_context_value_for_update(Map.get(running_entry, :thread_id), update, :thread_id),
+        turn_id: codex_context_value_for_update(Map.get(running_entry, :turn_id), update, :turn_id),
+        codex_session_source_path:
+          codex_context_value_for_update(
+            Map.get(running_entry, :codex_session_source_path),
+            update,
+            :codex_session_source_path
+          ),
         last_codex_event: event,
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
@@ -1460,6 +1529,20 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp session_id_for_update(existing, _update), do: existing
 
+  defp codex_context_value_for_update(existing, update, key) when is_map(update) do
+    case Map.get(update, key) do
+      value when is_binary(value) and value != "" -> value
+      _ -> codex_context_string_value_for_update(existing, update, key)
+    end
+  end
+
+  defp codex_context_string_value_for_update(existing, update, key) do
+    case Map.get(update, to_string(key)) do
+      value when is_binary(value) and value != "" -> value
+      _ -> existing
+    end
+  end
+
   defp turn_count_for_update(existing_count, existing_session_id, %{
          event: :session_started,
          session_id: session_id
@@ -1484,6 +1567,137 @@ defmodule SymphonyElixir.Orchestrator do
       message: update[:payload] || update[:raw],
       timestamp: update[:timestamp]
     }
+  end
+
+  defp record_codex_evidence_update(running_entry, %{event: :session_started} = update) do
+    context = evidence_context_for_update(running_entry, update)
+    attrs = evidence_attrs_for_update(running_entry, update)
+
+    case Evidence.capture_session_started(context, attrs) do
+      {:ok, evidence_context} ->
+        Map.put(running_entry, :evidence_context, evidence_context)
+
+      {:error, reason} ->
+        log_evidence_capture_failure(running_entry, :session_started, reason)
+        running_entry
+    end
+  end
+
+  defp record_codex_evidence_update(running_entry, %{event: :session_completed} = update) do
+    context = evidence_context_for_update(running_entry, update)
+    attrs = evidence_attrs_for_update(running_entry, update)
+
+    case Evidence.capture_session_completed(context, attrs) do
+      {:ok, evidence_context} ->
+        Map.put(running_entry, :evidence_context, evidence_context)
+
+      {:error, reason} ->
+        log_evidence_capture_failure(running_entry, :session_completed, reason)
+        running_entry
+    end
+  end
+
+  defp record_codex_evidence_update(running_entry, %{event: :session_failed} = update) do
+    context = evidence_context_for_update(running_entry, update)
+    attrs = evidence_attrs_for_update(running_entry, update)
+
+    case Evidence.capture_session_failed(context, attrs) do
+      {:ok, evidence_context} ->
+        Map.put(running_entry, :evidence_context, evidence_context)
+
+      {:error, reason} ->
+        log_evidence_capture_failure(running_entry, :session_failed, reason)
+        running_entry
+    end
+  end
+
+  defp record_codex_evidence_update(running_entry, _update), do: running_entry
+
+  defp maybe_record_abnormal_worker_exit(_running_entry, :normal), do: :ok
+  defp maybe_record_abnormal_worker_exit(%{last_codex_event: :session_failed}, _reason), do: :ok
+
+  defp maybe_record_abnormal_worker_exit(%{evidence_context: evidence_context} = running_entry, reason)
+       when is_map(evidence_context) do
+    attrs = %{
+      last_error: inspect(reason),
+      reason: reason,
+      session_id: Map.get(running_entry, :session_id),
+      thread_id: Map.get(running_entry, :thread_id),
+      turn_id: Map.get(running_entry, :turn_id)
+    }
+
+    case Evidence.capture_session_failed(evidence_context, attrs) do
+      {:ok, _evidence_context} ->
+        :ok
+
+      {:error, capture_reason} ->
+        log_evidence_capture_failure(running_entry, :worker_exit_failed, capture_reason)
+    end
+  end
+
+  defp maybe_record_abnormal_worker_exit(_running_entry, _reason), do: :ok
+
+  defp evidence_context_for_update(running_entry, update) do
+    (Map.get(running_entry, :evidence_context) || %{})
+    |> Map.merge(issue_evidence_context(Map.get(running_entry, :issue), Map.get(running_entry, :identifier)))
+    |> maybe_put_evidence_value(:workspace_path, Map.get(update, :workspace_path) || Map.get(running_entry, :workspace_path))
+    |> maybe_put_evidence_value(:worker_host, Map.get(update, :worker_host) || Map.get(running_entry, :worker_host))
+    |> maybe_put_evidence_value(:session_id, Map.get(update, :session_id) || Map.get(running_entry, :session_id))
+    |> maybe_put_evidence_value(:thread_id, Map.get(update, :thread_id) || Map.get(running_entry, :thread_id))
+    |> maybe_put_evidence_value(:turn_id, Map.get(update, :turn_id) || Map.get(running_entry, :turn_id))
+    |> maybe_put_evidence_value(
+      :codex_session_source_path,
+      Map.get(update, :codex_session_source_path) || Map.get(running_entry, :codex_session_source_path)
+    )
+    |> maybe_put_evidence_value(:thread_parse_status, Map.get(update, :thread_parse_status))
+    |> maybe_put_evidence_value(:turn_parse_status, Map.get(update, :turn_parse_status))
+    |> maybe_put_evidence_value(:codex_session_path_parse_status, Map.get(update, :codex_session_path_parse_status))
+  end
+
+  defp evidence_attrs_for_update(running_entry, update) do
+    update
+    |> Map.take([
+      :session_id,
+      :thread_id,
+      :turn_id,
+      :thread_parse_status,
+      :turn_parse_status,
+      :codex_session_source_path,
+      :codex_session_path_parse_status,
+      :workspace_path,
+      :worker_host,
+      :reason
+    ])
+    |> maybe_put_evidence_value(:linear, Map.get(running_entry, :issue))
+    |> maybe_put_evidence_value(:issue, Map.get(running_entry, :issue))
+  end
+
+  defp issue_evidence_context(%Issue{} = issue, _identifier) do
+    %{
+      issue_id: issue.id,
+      issue_identifier: issue.identifier
+    }
+  end
+
+  defp issue_evidence_context(_issue, identifier) when is_binary(identifier) do
+    %{
+      issue_id: nil,
+      issue_identifier: identifier
+    }
+  end
+
+  defp issue_evidence_context(_issue, _identifier), do: %{}
+
+  defp maybe_put_evidence_value(map, _key, nil), do: map
+  defp maybe_put_evidence_value(map, _key, ""), do: map
+  defp maybe_put_evidence_value(map, key, value), do: Map.put(map, key, value)
+
+  defp log_evidence_capture_failure(running_entry, event, reason) do
+    identifier = Map.get(running_entry, :identifier, "n/a")
+    session_id = running_entry_session_id(running_entry)
+
+    Logger.warning("Session lifecycle evidence capture failed issue_identifier=#{identifier} session_id=#{session_id} event=#{event} error=#{inspect(reason)}")
+    :ok
   end
 
   defp schedule_tick(%State{} = state, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do

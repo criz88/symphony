@@ -120,6 +120,114 @@ defmodule SymphonyElixir.EvidenceTest do
     end
   end
 
+  test "session lifecycle evidence copies rollout jsonl and writes linear summary" do
+    test_root = tmp_dir("evidence-session-lifecycle")
+    logs_root = Path.join(test_root, "logs")
+    rollout_path = Path.join(test_root, "rollout-2026-05-06.jsonl")
+    workspace = Path.join(test_root, "workspace")
+    Application.put_env(:symphony_elixir, :logs_root, logs_root)
+
+    try do
+      File.mkdir_p!(workspace)
+      File.write!(rollout_path, ~s({"type":"session","id":"thread-55"}\n))
+
+      context = %{
+        issue_id: "issue-55",
+        issue_identifier: "DOC-55",
+        run_id: "session-run",
+        session_id: "thread-55-turn-1",
+        thread_id: "thread-55",
+        turn_id: "turn-1",
+        thread_parse_status: "parsed",
+        turn_parse_status: "parsed",
+        codex_session_source_path: rollout_path,
+        codex_session_path_parse_status: "parsed",
+        workspace_path: workspace
+      }
+
+      issue = %{
+        id: "issue-55",
+        identifier: "DOC-55",
+        title: "Capture lifecycle evidence",
+        state: "In Progress",
+        branch_name: "feat/doc-55-session-evidence-lifecycle",
+        url: "https://linear.app/criz/issue/DOC-55",
+        labels: ["area-symphony"]
+      }
+
+      assert {:ok, evidence_context} =
+               Evidence.capture_session_started(context, %{linear: issue})
+
+      assert {:ok, _evidence_context} =
+               Evidence.capture_session_completed(evidence_context, %{})
+
+      session_dir = Path.join([logs_root, "evidence", "sessions", "DOC-55", "session-run"])
+
+      assert File.read!(Path.join(session_dir, "codex-session.jsonl")) =~ "thread-55"
+
+      linear = read_json!(Path.join(session_dir, "linear.json"))
+      assert linear["issue"]["id"] == "issue-55"
+      assert linear["issue"]["identifier"] == "DOC-55"
+      assert linear["issue"]["state"] == "In Progress"
+
+      manifest = read_json!(Path.join(session_dir, "manifest.json"))
+      assert manifest["session_id"] == "thread-55-turn-1"
+      assert manifest["thread_id"] == "thread-55"
+      assert manifest["turn_id"] == "turn-1"
+      assert manifest["thread_parse_status"] == "parsed"
+      assert manifest["turn_parse_status"] == "parsed"
+      assert manifest["artifact_paths"]["codex_session"] == "codex-session.jsonl"
+      assert manifest["artifact_paths"]["linear"] == "linear.json"
+      assert manifest["artifacts"]["codex_session"]["status"] == "captured"
+      assert manifest["artifacts"]["codex_session"]["source_path"] == rollout_path
+      assert manifest["artifacts"]["codex_session"]["details"]["copy_status"] == "copied"
+      assert manifest["codex_session_copy_status"] == "copied"
+      assert manifest["outcome"] == "completed"
+
+      categories =
+        session_dir
+        |> Path.join("events.jsonl")
+        |> read_jsonl!()
+        |> Enum.map(& &1["category"])
+
+      assert "session_started" in categories
+      assert "session_completed" in categories
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "session lifecycle evidence indexes missing rollout source with copy risk" do
+    test_root = tmp_dir("evidence-session-index")
+    logs_root = Path.join(test_root, "logs")
+    missing_rollout_path = Path.join(test_root, "missing-rollout.jsonl")
+    Application.put_env(:symphony_elixir, :logs_root, logs_root)
+
+    try do
+      context = %{
+        issue_identifier: "DOC-55",
+        run_id: "indexed-run",
+        session_id: "thread-55-turn-2",
+        thread_id: "thread-55",
+        turn_id: "turn-2",
+        codex_session_source_path: missing_rollout_path
+      }
+
+      assert {:ok, _evidence_context} =
+               Evidence.capture_session_started(context, %{linear: %{identifier: "DOC-55"}})
+
+      manifest = read_json!(Path.join([logs_root, "evidence", "sessions", "DOC-55", "indexed-run", "manifest.json"]))
+
+      refute Map.has_key?(manifest["artifact_paths"], "codex_session")
+      assert manifest["artifacts"]["codex_session"]["status"] == "indexed"
+      assert manifest["artifacts"]["codex_session"]["reason"] == "source_not_found"
+      assert manifest["artifacts"]["codex_session"]["details"]["copy_status"] == "not_attempted"
+      assert manifest["artifacts"]["codex_session"]["details"]["risk"] =~ "source_may_be_removed"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "cleanup preflight writes git summary and preserves DOC-18 shaped prloop artifacts" do
     test_root = tmp_dir("evidence-cleanup-preflight")
     logs_root = Path.join(test_root, "logs")
