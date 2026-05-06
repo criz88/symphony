@@ -33,13 +33,16 @@ defmodule SymphonyElixir.TestSupport do
 
         File.mkdir_p!(workflow_root)
         workflow_file = Path.join(workflow_root, "WORKFLOW.md")
+        logs_root = Path.join(workflow_root, "logs")
         write_workflow_file!(workflow_file)
         Workflow.set_workflow_file_path(workflow_file)
+        Application.put_env(:symphony_elixir, :logs_root, logs_root)
         if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
         stop_default_http_server()
 
         on_exit(fn ->
           Application.delete_env(:symphony_elixir, :workflow_file_path)
+          Application.delete_env(:symphony_elixir, :logs_root)
           Application.delete_env(:symphony_elixir, :server_port_override)
           Application.delete_env(:symphony_elixir, :memory_tracker_issues)
           Application.delete_env(:symphony_elixir, :memory_tracker_recipient)

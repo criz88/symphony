@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, PathSafety, SSH}
+  alias SymphonyElixir.{Config, Evidence, PathSafety, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
@@ -88,13 +88,34 @@ defmodule SymphonyElixir.Workspace do
   def remove(workspace), do: remove(workspace, nil)
 
   @spec remove(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
-  def remove(workspace, nil) do
+  def remove(workspace, worker_host) do
+    remove(workspace, worker_host, %{issue_id: nil, issue_identifier: Path.basename(workspace)})
+  end
+
+  @spec remove(Path.t(), worker_host(), map()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
+  def remove(workspace, nil, issue_context) do
     case File.exists?(workspace) do
       true ->
         case validate_workspace_path(workspace, nil) do
           :ok ->
-            maybe_run_before_remove_hook(workspace, nil)
-            File.rm_rf(workspace)
+            evidence_context = cleanup_evidence_context(issue_context, workspace)
+
+            case Evidence.capture_workspace_cleanup_preflight(evidence_context, workspace) do
+              {:ok, evidence_context} ->
+                maybe_run_before_remove_hook(workspace, nil)
+
+                case File.rm_rf(workspace) do
+                  {:ok, _removed_paths} = result ->
+                    record_cleanup_completed(evidence_context, workspace)
+                    result
+
+                  {:error, _reason, _file} = error ->
+                    error
+                end
+
+              {:error, reason} ->
+                {:error, reason, ""}
+            end
 
           {:error, reason} ->
             {:error, reason, ""}
@@ -105,62 +126,78 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  def remove(workspace, worker_host) when is_binary(worker_host) do
-    maybe_run_before_remove_hook(workspace, worker_host)
+  def remove(workspace, worker_host, issue_context) when is_binary(worker_host) do
+    evidence_context = cleanup_evidence_context(issue_context, workspace)
 
-    script =
-      [
-        remote_shell_assign("workspace", workspace),
-        "rm -rf \"$workspace\""
-      ]
-      |> Enum.join("\n")
+    case Evidence.capture_workspace_cleanup_preflight(evidence_context, workspace) do
+      {:ok, evidence_context} ->
+        maybe_run_before_remove_hook(workspace, worker_host)
 
-    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
-      {:ok, {_output, 0}} ->
-        {:ok, []}
+        script =
+          [
+            remote_shell_assign("workspace", workspace),
+            "rm -rf \"$workspace\""
+          ]
+          |> Enum.join("\n")
 
-      {:ok, {output, status}} ->
-        {:error, {:workspace_remove_failed, worker_host, status, output}, ""}
+        case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+          {:ok, {_output, 0}} ->
+            record_cleanup_completed(evidence_context, workspace)
+            {:ok, []}
+
+          {:ok, {output, status}} ->
+            {:error, {:workspace_remove_failed, worker_host, status, output}, ""}
+
+          {:error, reason} ->
+            {:error, reason, ""}
+        end
 
       {:error, reason} ->
         {:error, reason, ""}
     end
   end
 
-  @spec remove_issue_workspaces(term()) :: :ok
+  @spec remove_issue_workspaces(term()) :: :ok | {:error, term()}
   def remove_issue_workspaces(identifier), do: remove_issue_workspaces(identifier, nil)
 
-  @spec remove_issue_workspaces(term(), worker_host()) :: :ok
-  def remove_issue_workspaces(identifier, worker_host) when is_binary(identifier) and is_binary(worker_host) do
-    safe_id = safe_identifier(identifier)
+  @spec remove_issue_workspaces(term(), worker_host()) :: :ok | {:error, term()}
+  def remove_issue_workspaces(issue_or_identifier, worker_host) do
+    case removable_issue_context(issue_or_identifier) do
+      %{issue_identifier: identifier} = issue_context when is_binary(identifier) ->
+        do_remove_issue_workspaces(issue_context, worker_host)
 
-    case workspace_path_for_issue(safe_id, worker_host) do
-      {:ok, workspace} -> remove(workspace, worker_host)
-      {:error, _reason} -> :ok
+      _ ->
+        :ok
     end
-
-    :ok
   end
 
-  def remove_issue_workspaces(identifier, nil) when is_binary(identifier) do
-    safe_id = safe_identifier(identifier)
+  defp do_remove_issue_workspaces(issue_context, worker_host) when is_binary(worker_host) do
+    safe_id = safe_identifier(issue_context.issue_identifier)
 
+    case workspace_path_for_issue(safe_id, worker_host) do
+      {:ok, workspace} -> normalize_remove_result(remove(workspace, worker_host, issue_context))
+      {:error, _reason} -> :ok
+    end
+  end
+
+  defp do_remove_issue_workspaces(issue_context, nil) do
     case Config.settings!().worker.ssh_hosts do
       [] ->
+        safe_id = safe_identifier(issue_context.issue_identifier)
+
         case workspace_path_for_issue(safe_id, nil) do
-          {:ok, workspace} -> remove(workspace, nil)
+          {:ok, workspace} -> normalize_remove_result(remove(workspace, nil, issue_context))
           {:error, _reason} -> :ok
         end
 
       worker_hosts ->
-        Enum.each(worker_hosts, &remove_issue_workspaces(identifier, &1))
+        Enum.reduce_while(worker_hosts, :ok, fn worker_host, _acc ->
+          case do_remove_issue_workspaces(issue_context, worker_host) do
+            :ok -> {:cont, :ok}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
+        end)
     end
-
-    :ok
-  end
-
-  def remove_issue_workspaces(_identifier, _worker_host) do
-    :ok
   end
 
   @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
@@ -290,6 +327,39 @@ defmodule SymphonyElixir.Workspace do
 
   defp ignore_hook_failure(:ok), do: :ok
   defp ignore_hook_failure({:error, _reason}), do: :ok
+
+  defp record_cleanup_completed(evidence_context, workspace) do
+    case Evidence.capture_workspace_cleanup_completed(evidence_context, workspace) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Workspace cleanup completion evidence failed #{issue_log_context(evidence_context)} workspace=#{workspace} error=#{inspect(reason)}")
+        :ok
+    end
+  end
+
+  defp cleanup_evidence_context(issue_context, workspace) do
+    issue_context
+    |> Map.take([:issue_id, :issue_identifier])
+    |> Map.merge(%{
+      workspace_path: workspace,
+      source: "workspace_hook"
+    })
+  end
+
+  defp normalize_remove_result({:ok, _removed_paths}), do: :ok
+  defp normalize_remove_result({:error, reason, _file}), do: {:error, reason}
+
+  defp removable_issue_context(%{identifier: identifier} = issue) when is_binary(identifier) do
+    issue_context(issue)
+  end
+
+  defp removable_issue_context(identifier) when is_binary(identifier) do
+    issue_context(identifier)
+  end
+
+  defp removable_issue_context(_issue_or_identifier), do: nil
 
   defp run_hook(command, workspace, issue_context, hook_name, nil) do
     timeout_ms = Config.settings!().hooks.timeout_ms
