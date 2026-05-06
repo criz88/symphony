@@ -439,7 +439,7 @@ defmodule SymphonyElixir.Evidence do
              status: "captured",
              path: "prloop/logs",
              source: "prloop",
-             source_path: preferred_log_dir(metadata, source)
+             source_path: preferred_log_dir(metadata, prloop_root, source)
            }}
         else
           {:error, reason, file} -> {:error, {:prloop_logs_copy_failed, file, reason}}
@@ -576,7 +576,7 @@ defmodule SymphonyElixir.Evidence do
 
   defp path_inside?(path, root) do
     relative = Path.relative_to(path, root)
-    relative != ".." and not String.starts_with?(relative, "../")
+    Path.type(relative) == :relative and relative != ".." and not String.starts_with?(relative, "../")
   end
 
   defp prloop_metadata(prloop_root) do
@@ -626,10 +626,10 @@ defmodule SymphonyElixir.Evidence do
     end)
   end
 
-  defp preferred_log_dir(metadata, fallback) do
+  defp preferred_log_dir(metadata, prloop_root, fallback) do
     metadata
     |> Map.get(:log_dirs, [])
-    |> Enum.find(&is_binary/1)
+    |> Enum.find_value(&normalize_prloop_path(&1, prloop_root))
     |> case do
       nil -> fallback
       path -> path

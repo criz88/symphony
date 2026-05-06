@@ -235,6 +235,48 @@ defmodule SymphonyElixir.EvidenceTest do
     end
   end
 
+  test "cleanup preflight ignores prloop logDir outside prloop root" do
+    test_root = tmp_dir("evidence-cleanup-prloop-logdir")
+    logs_root = Path.join(test_root, "logs")
+    workspace = Path.join(test_root, "workspace")
+    outside_log_dir = Path.join(test_root, "outside-logs")
+    Application.put_env(:symphony_elixir, :logs_root, logs_root)
+
+    try do
+      create_git_workspace!(workspace)
+
+      prloop_root = Path.join([workspace, ".git", "cloud-review-loop"])
+      state_path = Path.join([prloop_root, "state", "run-789", "state.json"])
+      log_dir = Path.join(prloop_root, "tmux")
+      File.mkdir_p!(Path.dirname(state_path))
+      File.mkdir_p!(log_dir)
+      File.mkdir_p!(outside_log_dir)
+      File.write!(state_path, ~s({"state":"succeeded","runId":"run-789"}))
+
+      File.write!(
+        Path.join(log_dir, "prloop.log"),
+        Jason.encode!(%{"statePath" => state_path, "logDir" => outside_log_dir}) <> "\n"
+      )
+
+      context = %{
+        issue_identifier: "DOC-54",
+        run_id: "cleanup-logdir-run",
+        workspace_path: workspace
+      }
+
+      assert {:ok, _evidence_context} = Evidence.capture_workspace_cleanup_preflight(context, workspace)
+
+      session_dir = Path.join([logs_root, "evidence", "sessions", "DOC-54", "cleanup-logdir-run"])
+      manifest = read_json!(Path.join(session_dir, "manifest.json"))
+
+      assert manifest["artifact_paths"]["prloop_log_dir"] == "prloop/logs"
+      assert manifest["artifacts"]["prloop_log_dir"]["source_path"] == log_dir
+      refute manifest["artifacts"]["prloop_log_dir"]["source_path"] == outside_log_dir
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   defp create_git_workspace!(workspace) do
     File.mkdir_p!(workspace)
     run!("git", ["-C", workspace, "init", "-b", "main"])
