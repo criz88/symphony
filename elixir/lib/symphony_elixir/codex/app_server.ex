@@ -21,6 +21,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
           thread_id: String.t(),
+          thread_metadata: map(),
           workspace: Path.t(),
           worker_host: String.t() | nil
         }
@@ -45,7 +46,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
-           {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
+           {:ok, thread_metadata} <- do_start_session(port, expanded_workspace, session_policies) do
         {:ok,
          %{
            port: port,
@@ -54,7 +55,8 @@ defmodule SymphonyElixir.Codex.AppServer do
            auto_approve_requests: session_policies.approval_policy == "never",
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
-           thread_id: thread_id,
+           thread_id: thread_metadata.thread_id,
+           thread_metadata: thread_metadata,
            workspace: expanded_workspace,
            worker_host: worker_host
          }}
@@ -75,6 +77,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           auto_approve_requests: auto_approve_requests,
           turn_sandbox_policy: turn_sandbox_policy,
           thread_id: thread_id,
+          thread_metadata: thread_metadata,
           workspace: workspace
         },
         prompt,
@@ -96,17 +99,33 @@ defmodule SymphonyElixir.Codex.AppServer do
         emit_message(
           on_message,
           :session_started,
-          %{
+          Map.merge(thread_metadata, %{
             session_id: session_id,
             thread_id: thread_id,
-            turn_id: turn_id
-          },
+            thread_parse_status: "parsed",
+            turn_id: turn_id,
+            turn_parse_status: "parsed",
+            workspace_path: workspace
+          }),
           metadata
         )
 
         case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
           {:ok, result} ->
             Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
+
+            emit_message(
+              on_message,
+              :session_completed,
+              %{
+                session_id: session_id,
+                thread_id: thread_id,
+                turn_id: turn_id,
+                workspace_path: workspace,
+                result: result
+              },
+              metadata
+            )
 
             {:ok,
              %{
@@ -124,6 +143,19 @@ defmodule SymphonyElixir.Codex.AppServer do
               :turn_ended_with_error,
               %{
                 session_id: session_id,
+                reason: reason
+              },
+              metadata
+            )
+
+            emit_message(
+              on_message,
+              :session_failed,
+              %{
+                session_id: session_id,
+                thread_id: thread_id,
+                turn_id: turn_id,
+                workspace_path: workspace,
                 reason: reason
               },
               metadata
@@ -292,7 +324,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     case await_response(port, @thread_start_id) do
       {:ok, %{"thread" => thread_payload}} ->
         case thread_payload do
-          %{"id" => thread_id} -> {:ok, thread_id}
+          %{"id" => thread_id} -> {:ok, thread_metadata(thread_id, thread_payload)}
           _ -> {:error, {:invalid_thread_payload, thread_payload}}
         end
 
@@ -325,6 +357,81 @@ defmodule SymphonyElixir.Codex.AppServer do
       other -> other
     end
   end
+
+  defp thread_metadata(thread_id, thread_payload) do
+    codex_session_source_path = codex_session_source_path(thread_payload)
+
+    %{
+      thread_id: thread_id,
+      thread_parse_status: "parsed",
+      codex_session_source_path: codex_session_source_path,
+      codex_session_path_parse_status: codex_session_path_parse_status(codex_session_source_path),
+      thread_started_payload: thread_payload
+    }
+  end
+
+  defp codex_session_path_parse_status(path) when is_binary(path), do: "parsed"
+  defp codex_session_path_parse_status(_path), do: "missing"
+
+  defp codex_session_source_path(thread_payload) when is_map(thread_payload) do
+    direct_session_path(thread_payload) || nested_session_path(thread_payload)
+  end
+
+  defp codex_session_source_path(_thread_payload), do: nil
+
+  defp direct_session_path(thread_payload) do
+    [
+      "rollout_path",
+      "rolloutPath",
+      "rolloutJsonlPath",
+      "session_jsonl_path",
+      "sessionJsonlPath",
+      "jsonl_path",
+      "jsonlPath",
+      "session_path",
+      "sessionPath"
+    ]
+    |> Enum.find_value(fn key ->
+      case Map.get(thread_payload, key) do
+        path when is_binary(path) and path != "" -> path
+        _ -> nil
+      end
+    end)
+  end
+
+  defp nested_session_path(thread_payload) do
+    thread_payload
+    |> flattened_values()
+    |> Enum.find_value(fn {key, value} ->
+      if session_path_key?(key) and session_path_value?(value), do: value
+    end)
+  end
+
+  defp flattened_values(value), do: flattened_values(value, [])
+
+  defp flattened_values(%{} = map, acc) do
+    Enum.reduce(map, acc, fn {key, value}, acc ->
+      flattened_values(value, [{to_string(key), value} | acc])
+    end)
+  end
+
+  defp flattened_values(values, acc) when is_list(values) do
+    Enum.reduce(values, acc, &flattened_values(&1, &2))
+  end
+
+  defp flattened_values(_value, acc), do: acc
+
+  defp session_path_key?(key) when is_binary(key) do
+    key
+    |> Macro.underscore()
+    |> String.contains?("path")
+  end
+
+  defp session_path_value?(value) when is_binary(value) do
+    String.ends_with?(value, ".jsonl") or String.contains?(value, "rollout-")
+  end
+
+  defp session_path_value?(_value), do: false
 
   defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
     receive_loop(

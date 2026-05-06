@@ -183,6 +183,105 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server emits session lifecycle metadata from thread payload rollout path" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-rollout-path-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "DOC-55")
+      codex_binary = Path.join(test_root, "fake-codex")
+      rollout_path = Path.join(test_root, "rollout-2026-05-06.jsonl")
+      File.mkdir_p!(workspace)
+      File.write!(rollout_path, ~s({"type":"session"}\n))
+
+      thread_response =
+        Jason.encode!(%{
+          "id" => 2,
+          "result" => %{
+            "thread" => %{
+              "id" => "thread-rollout",
+              "rolloutPath" => rollout_path
+            }
+          }
+        })
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '#{thread_response}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-rollout"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-rollout",
+        identifier: "DOC-55",
+        title: "Capture rollout path",
+        description: "Ensure app-server forwards rollout metadata",
+        state: "In Progress",
+        url: "https://example.org/issues/DOC-55",
+        labels: ["area-symphony"]
+      }
+
+      on_message = fn message -> send(self(), {:app_server_message, message}) end
+
+      assert {:ok, _result} = AppServer.run(workspace, "Capture rollout", issue, on_message: on_message)
+
+      assert_received {:app_server_message,
+                       %{
+                         event: :session_started,
+                         session_id: "thread-rollout-turn-rollout",
+                         thread_id: "thread-rollout",
+                         turn_id: "turn-rollout",
+                         thread_parse_status: "parsed",
+                         turn_parse_status: "parsed",
+                         codex_session_source_path: ^rollout_path,
+                         codex_session_path_parse_status: "parsed"
+                       }}
+
+      assert_received {:app_server_message,
+                       %{
+                         event: :session_completed,
+                         session_id: "thread-rollout-turn-rollout",
+                         thread_id: "thread-rollout",
+                         turn_id: "turn-rollout"
+                       }}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server marks request-for-input events as a hard failure" do
     test_root =
       Path.join(
