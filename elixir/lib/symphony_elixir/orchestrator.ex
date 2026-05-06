@@ -480,26 +480,7 @@ defmodule SymphonyElixir.Orchestrator do
     case Map.get(state.running, issue_id) do
       %{issue: %Issue{state: previous_state}, evidence_context: evidence_context} = running_entry
       when is_map(evidence_context) ->
-        if same_issue_state?(previous_state, issue.state) do
-          state
-        else
-          attrs = %{
-            evidence_ref: "linear.json",
-            summary: "Linear state changed from #{previous_state} to #{issue.state}",
-            trust_level: "machine_captured",
-            previous_state: previous_state,
-            new_state: issue.state
-          }
-
-          with {:ok, evidence_context} <- Evidence.write_linear_summary(evidence_context, issue),
-               {:ok, evidence_context} <- Evidence.append_event(evidence_context, "linear_state_changed", attrs) do
-            put_running_entry(state, issue_id, Map.put(running_entry, :evidence_context, evidence_context))
-          else
-            {:error, reason} ->
-              Logger.warning("Linear state evidence capture failed for #{issue_context(issue)} error=#{inspect(reason)}")
-              state
-          end
-        end
+        maybe_record_linear_state_change(state, issue, running_entry, previous_state, evidence_context)
 
       _ ->
         state
@@ -507,6 +488,39 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp record_linear_state_change(%State{} = state, _issue), do: state
+
+  defp maybe_record_linear_state_change(state, issue, running_entry, previous_state, evidence_context) do
+    if same_issue_state?(previous_state, issue.state) do
+      state
+    else
+      record_linear_state_evidence(state, issue, running_entry, previous_state, evidence_context)
+    end
+  end
+
+  defp record_linear_state_evidence(state, issue, running_entry, previous_state, evidence_context) do
+    attrs = %{
+      evidence_ref: "linear.json",
+      summary: "Linear state changed from #{previous_state} to #{issue.state}",
+      trust_level: "machine_captured",
+      previous_state: previous_state,
+      new_state: issue.state
+    }
+
+    case write_linear_state_evidence(evidence_context, issue, attrs) do
+      {:ok, evidence_context} ->
+        put_running_entry(state, issue.id, Map.put(running_entry, :evidence_context, evidence_context))
+
+      {:error, reason} ->
+        Logger.warning("Linear state evidence capture failed for #{issue_context(issue)} error=#{inspect(reason)}")
+        state
+    end
+  end
+
+  defp write_linear_state_evidence(evidence_context, issue, attrs) do
+    with {:ok, evidence_context} <- Evidence.write_linear_summary(evidence_context, issue) do
+      Evidence.append_event(evidence_context, "linear_state_changed", attrs)
+    end
+  end
 
   defp same_issue_state?(left, right) when is_binary(left) and is_binary(right) do
     normalize_issue_state(left) == normalize_issue_state(right)

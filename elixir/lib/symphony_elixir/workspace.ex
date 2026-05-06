@@ -100,35 +100,12 @@ defmodule SymphonyElixir.Workspace do
   @spec remove(Path.t(), worker_host(), map(), map() | nil) ::
           {:ok, [String.t()]} | {:error, term(), String.t()}
   def remove(workspace, nil, issue_context, evidence_context) do
-    case File.exists?(workspace) do
-      true ->
-        case validate_workspace_path(workspace, nil) do
-          :ok ->
-            evidence_context = cleanup_evidence_context(issue_context, workspace, evidence_context)
-
-            case Evidence.capture_workspace_cleanup_preflight(evidence_context, workspace) do
-              {:ok, evidence_context} ->
-                maybe_run_before_remove_hook(workspace, nil)
-
-                case File.rm_rf(workspace) do
-                  {:ok, _removed_paths} = result ->
-                    record_cleanup_completed(evidence_context, workspace)
-                    result
-
-                  {:error, _reason, _file} = error ->
-                    error
-                end
-
-              {:error, reason} ->
-                {:error, reason, ""}
-            end
-
-          {:error, reason} ->
-            {:error, reason, ""}
-        end
-
-      false ->
-        File.rm_rf(workspace)
+    with true <- File.exists?(workspace),
+         :ok <- validate_workspace_path(workspace, nil) do
+      remove_existing_local_workspace(workspace, issue_context, evidence_context)
+    else
+      false -> File.rm_rf(workspace)
+      {:error, reason} -> {:error, reason, ""}
     end
   end
 
@@ -163,6 +140,31 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  defp remove_existing_local_workspace(workspace, issue_context, evidence_context) do
+    evidence_context = cleanup_evidence_context(issue_context, workspace, evidence_context)
+
+    case Evidence.capture_workspace_cleanup_preflight(evidence_context, workspace) do
+      {:ok, evidence_context} ->
+        remove_local_workspace_after_preflight(workspace, evidence_context)
+
+      {:error, reason} ->
+        {:error, reason, ""}
+    end
+  end
+
+  defp remove_local_workspace_after_preflight(workspace, evidence_context) do
+    maybe_run_before_remove_hook(workspace, nil)
+
+    case File.rm_rf(workspace) do
+      {:ok, _removed_paths} = result ->
+        record_cleanup_completed(evidence_context, workspace)
+        result
+
+      {:error, _reason, _file} = error ->
+        error
+    end
+  end
+
   @spec remove_issue_workspaces(term()) :: :ok | {:error, term()}
   def remove_issue_workspaces(identifier), do: remove_issue_workspaces(identifier, nil)
 
@@ -192,23 +194,25 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp do_remove_issue_workspaces(issue_context, nil, evidence_context) do
-    case Config.settings!().worker.ssh_hosts do
-      [] ->
-        safe_id = safe_identifier(issue_context.issue_identifier)
+    remove_issue_workspaces_for_hosts(Config.settings!().worker.ssh_hosts, issue_context, evidence_context)
+  end
 
-        case workspace_path_for_issue(safe_id, nil) do
-          {:ok, workspace} -> normalize_remove_result(remove(workspace, nil, issue_context, evidence_context))
-          {:error, _reason} -> :ok
-        end
+  defp remove_issue_workspaces_for_hosts([], issue_context, evidence_context) do
+    safe_id = safe_identifier(issue_context.issue_identifier)
 
-      worker_hosts ->
-        Enum.reduce_while(worker_hosts, :ok, fn worker_host, _acc ->
-          case do_remove_issue_workspaces(issue_context, worker_host, evidence_context) do
-            :ok -> {:cont, :ok}
-            {:error, reason} -> {:halt, {:error, reason}}
-          end
-        end)
+    case workspace_path_for_issue(safe_id, nil) do
+      {:ok, workspace} -> normalize_remove_result(remove(workspace, nil, issue_context, evidence_context))
+      {:error, _reason} -> :ok
     end
+  end
+
+  defp remove_issue_workspaces_for_hosts(worker_hosts, issue_context, evidence_context) do
+    Enum.reduce_while(worker_hosts, :ok, fn worker_host, _acc ->
+      case do_remove_issue_workspaces(issue_context, worker_host, evidence_context) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
   end
 
   @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host()) ::

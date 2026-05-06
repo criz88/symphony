@@ -1152,9 +1152,9 @@ defmodule SymphonyElixir.Evidence do
   end
 
   defp read_json_file(path) do
-    with {:ok, content} <- File.read(path),
-         {:ok, decoded} <- Jason.decode(content) do
-      {:ok, decoded}
+    case File.read(path) do
+      {:ok, content} -> Jason.decode(content)
+      {:error, reason} -> {:error, reason}
     end
   end
 

@@ -317,23 +317,52 @@ defmodule SymphonyElixir.ReviewMonitor do
     resumable? = run["resumable"] == true
     evidence = status_evidence(status)
 
-    cond do
-      state == "succeeded" or action == "done" ->
+    case status_recommendation(state, action, resumable?) do
+      :clean ->
         clean_issue(issue)
 
-      MapSet.member?(@blocked_actions, action) or (MapSet.member?(@failure_states, state) and not resumable?) ->
+      :blocked ->
         block_issue(issue, "prloop requires manual reconciliation (state=#{state}, action=#{action})", evidence)
 
-      action == "start" ->
+      {:tmux, "run"} ->
         ensure_tmux(issue, workspace, branch, pr, "run", runner, worker_host, evidence)
 
-      resumable? or MapSet.member?(@resumable_actions, action) ->
+      {:tmux, "resume"} ->
         ensure_tmux(issue, workspace, branch, pr, "resume", runner, worker_host, evidence)
 
-      true ->
+      :waiting ->
         Logger.info("Review monitor is waiting for #{issue_context(issue)} state=#{state} action=#{action} evidence=#{inspect(evidence)}")
         :waiting
     end
+  end
+
+  defp status_recommendation(state, action, resumable?) do
+    case {clean_status?(state, action), blocked_status?(state, action, resumable?)} do
+      {true, _blocked?} ->
+        :clean
+
+      {_clean?, true} ->
+        :blocked
+
+      {_clean?, _blocked?} ->
+        tmux_status_recommendation(action, resumable?)
+    end
+  end
+
+  defp clean_status?(state, action), do: state == "succeeded" or action == "done"
+
+  defp blocked_status?(state, action, resumable?) do
+    MapSet.member?(@blocked_actions, action) or failed_terminal_status?(state, resumable?)
+  end
+
+  defp failed_terminal_status?(_state, true), do: false
+  defp failed_terminal_status?(state, false), do: MapSet.member?(@failure_states, state)
+
+  defp tmux_status_recommendation("start", _resumable?), do: {:tmux, "run"}
+  defp tmux_status_recommendation(_action, true), do: {:tmux, "resume"}
+
+  defp tmux_status_recommendation(action, false) do
+    if MapSet.member?(@resumable_actions, action), do: {:tmux, "resume"}, else: :waiting
   end
 
   defp clean_issue(%Issue{id: issue_id} = issue) do
@@ -365,17 +394,39 @@ defmodule SymphonyElixir.ReviewMonitor do
   defp ensure_tmux(issue, workspace, branch, pr, prloop_command, runner, worker_host, evidence) do
     session = tmux_session_name(issue, pr)
 
+    tmux_context = %{
+      issue: issue,
+      workspace: workspace,
+      branch: branch,
+      pr: pr,
+      prloop_command: prloop_command,
+      runner: runner,
+      worker_host: worker_host,
+      evidence: evidence,
+      session: session
+    }
+
     case run_command(runner, "tmux", ["has-session", "-t", session], cd: workspace, worker_host: worker_host) do
       {:ok, _output} ->
         Logger.info("Review monitor found existing prloop tmux session for #{issue_context(issue)} session=#{session}")
         :waiting
 
       {:error, _reason} ->
-        start_tmux(issue, workspace, branch, pr, prloop_command, session, runner, worker_host, evidence)
+        start_tmux(tmux_context)
     end
   end
 
-  defp start_tmux(issue, workspace, branch, pr, prloop_command, session, runner, worker_host, evidence) do
+  defp start_tmux(%{
+         issue: issue,
+         workspace: workspace,
+         branch: branch,
+         pr: pr,
+         prloop_command: prloop_command,
+         session: session,
+         runner: runner,
+         worker_host: worker_host,
+         evidence: evidence
+       }) do
     log_dir = evidence[:log_dir] || git_log_dir(workspace, runner, worker_host)
     command = prloop_shell_command(prloop_command, workspace, branch, pr.ref, session, log_dir)
 
@@ -450,9 +501,7 @@ defmodule SymphonyElixir.ReviewMonitor do
 
   defp blocked_comment(reason, evidence) do
     details =
-      evidence
-      |> Enum.map(fn {key, value} -> "- #{key}: `#{value}`" end)
-      |> Enum.join("\n")
+      Enum.map_join(evidence, "\n", fn {key, value} -> "- #{key}: `#{value}`" end)
 
     base = "## Symphony Review Monitor\n\nMoved this issue to Human Review.\n\nReason: #{reason}"
 

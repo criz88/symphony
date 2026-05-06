@@ -492,7 +492,8 @@ defmodule SymphonyElixir.CoreTest do
       File.write!(Path.join(workspace, "uncommitted.txt"), "local work\n")
 
       prloop_root = Path.join([workspace, ".git", "cloud-review-loop"])
-      File.mkdir_p!(Path.join(prloop_root, "state.json"))
+      File.mkdir_p!(prloop_root)
+      File.write!(Path.join(prloop_root, "tmux"), "not a directory\n")
 
       agent_pid =
         spawn(fn ->
